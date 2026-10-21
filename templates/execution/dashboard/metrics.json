@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "metrics": [
+    {
+      "id": "example_web_metric",
+      "name": "示例网页指标",
+      "enabled": false,
+      "unit": "count",
+      "target": 100,
+      "direction": "up",
+      "source": "https://example.com",
+      "collector": "python3 edward/execution/dashboard/collectors/web_metric.py",
+      "timeout_seconds": 90,
+      "env": {
+        "METRIC_ID": "example_web_metric",
+        "METRIC_URL": "https://example.com",
+        "METRIC_SELECTOR": "#value",
+        "METRIC_UNIT": "count"
+      }
+    },
+    {
+      "id": "example_command_metric",
+      "name": "示例命令指标",
+      "enabled": false,
+      "unit": "count",
+      "target": 10,
+      "direction": "up",
+      "source": "local command",
+      "collector": "python3 edward/execution/dashboard/collectors/command_metric.py",
+      "timeout_seconds": 60,
+      "env": {
+        "METRIC_ID": "example_command_metric",
+        "METRIC_COMMAND": "printf '{\"value\": 42}'",
+        "METRIC_UNIT": "count"
+      }
+    }
+  ]
+}

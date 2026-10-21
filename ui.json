@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "host": "127.0.0.1",
+  "port": 8765,
+  "base_path": "/",
+  "document_root": "edward/execution/dashboard",
+  "token_env": "EDWARD_UI_TOKEN"
+}
