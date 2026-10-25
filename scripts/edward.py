@@ -44,7 +44,6 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
 
 
-VERSION = "0.2.0"
 FROZEN = bool(getattr(sys, "frozen", False))
 
 if FROZEN:
@@ -57,7 +56,51 @@ if FROZEN:
 else:
     SCRIPT_DIR = Path(__file__).resolve().parent
     OPENCODE_DIR = SCRIPT_DIR.parent
-    PROJECT_ROOT = Path(os.environ.get("EDWARD_PROJECT_ROOT", str(OPENCODE_DIR.parent))).resolve()
+    # Installed layout: <project>/.opencode/scripts. Source layout: <project>/scripts.
+    source_root = (
+        OPENCODE_DIR.parent if OPENCODE_DIR.name == ".opencode" else OPENCODE_DIR
+    )
+    PROJECT_ROOT = Path(os.environ.get("EDWARD_PROJECT_ROOT", str(source_root))).resolve()
+
+DEFAULT_VERSION = "0.0.0"
+VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?")
+
+
+def read_version_candidate(path: Path) -> str | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    value = ""
+    if path.suffix in {".yaml", ".yml"}:
+        for raw_line in text.splitlines():
+            line = raw_line.split("#", 1)[0].strip()
+            if line.startswith("version:"):
+                value = line.split(":", 1)[1].strip().strip("'\"")
+                break
+    elif text.strip():
+        value = text.strip().splitlines()[0].strip()
+    if value.startswith("v"):
+        value = value[1:]
+    return value if VERSION_PATTERN.fullmatch(value) else None
+
+
+def resolve_version() -> str:
+    candidates: list[Path] = []
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        candidates.append(Path(bundle_dir) / "EDWARD_VERSION")
+    if not FROZEN:
+        candidates.append(PROJECT_ROOT / "release.yaml")
+    candidates.append(OPENCODE_DIR / "VERSION")
+    for candidate in candidates:
+        value = read_version_candidate(candidate)
+        if value:
+            return value
+    return DEFAULT_VERSION
+
+
+VERSION = resolve_version()
 
 EDWARD_ROOT = PROJECT_ROOT / "edward"
 EXECUTION_DIR = EDWARD_ROOT / "execution"
@@ -1287,6 +1330,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
 
     print("Edward status")
+    print(f"  version:   {VERSION}")
     print(f"  project:   {PROJECT_ROOT}")
     print(f"  workspace: {EDWARD_ROOT}")
     print(f"  initialized: {'yes' if payload['initialized'] else 'no'}")
