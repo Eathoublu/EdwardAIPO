@@ -8,6 +8,7 @@ The service is intentionally dependency-free (Python standard library only):
   * status    inspect scheduler + daemon + pending replies
   * collect   run fixed metric collectors and refresh dashboard
   * dashboard render dashboard from the latest metric snapshot
+  * todo      manage cross-shift todos (add/list/update/start/done/delete)
   * run-now   trigger a shift immediately
   * pause / resume / stop
 """
@@ -106,6 +107,7 @@ EDWARD_ROOT = PROJECT_ROOT / "edward"
 EXECUTION_DIR = EDWARD_ROOT / "execution"
 REPORTS_DIR = EXECUTION_DIR / "reports"
 REPLIES_DIR = EXECUTION_DIR / "report-reply"
+TODOS_FILE = EXECUTION_DIR / "todos.json"
 DASHBOARD_DIR = EXECUTION_DIR / "dashboard"
 DASHBOARD_FILE = DASHBOARD_DIR / "dashboard.md"
 METRICS_FILE = DASHBOARD_DIR / "metrics.json"
@@ -126,6 +128,7 @@ LOCK_DIR = STATE_DIR / "locks"
 STATE_LOCK_FILE = LOCK_DIR / "state.lock"
 RUN_LOCK_FILE = LOCK_DIR / "run.lock"
 DAEMON_LOCK_FILE = LOCK_DIR / "daemon.lock"
+TODO_LOCK_FILE = LOCK_DIR / "todos.lock"
 EVENT_LOG = LOG_DIR / "edward.log"
 DOC_EDITS_FILE = STATE_DIR / "doc-edits.json"
 
@@ -140,6 +143,25 @@ UI_DEFAULT_DOCUMENT_ROOT = "edward/execution/dashboard"
 UI_COOKIE_NAME = "edward_ui_token"
 DOC_EDIT_LIMIT = 200
 DOC_CONTENT_MAX_BYTES = 512 * 1024
+
+TODO_STATUSES = ("pending", "in_progress", "done", "cancelled")
+TODO_PRIORITIES = ("high", "medium", "low")
+TODO_STATUS_LABELS = {
+    "pending": "待办",
+    "in_progress": "进行中",
+    "done": "已完成",
+    "cancelled": "已取消",
+}
+TODO_STATUS_BADGES = {
+    "pending": "blue",
+    "in_progress": "amber",
+    "done": "green",
+    "cancelled": "",
+}
+TODO_PRIORITY_LABELS = {"high": "高", "medium": "中", "low": "低"}
+TODO_PRIORITY_BADGES = {"high": "rose", "medium": "amber", "low": ""}
+TODO_PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
+TODO_OPEN_STATUSES = {"pending", "in_progress"}
 
 EXECUTION_DOCS = {
     "notebook": ("Notebook · 长期记忆", EXECUTION_DIR / "notebook.md"),
@@ -158,6 +180,7 @@ ARTIFACT_MAP = {
     "execution/goal.md": EXECUTION_DIR / "goal.md",
     "execution/plan.md": EXECUTION_DIR / "plan.md",
     "execution/current_state.md": EXECUTION_DIR / "current_state.md",
+    "execution/todos.json": TODOS_FILE,
     "execution/dashboard/dashboard.md": DASHBOARD_FILE,
     "execution/dashboard/metrics.json": METRICS_FILE,
     "execution/dashboard/collectors/web_metric.py": DASHBOARD_DIR / "collectors" / "web_metric.py",
@@ -463,6 +486,335 @@ def pid_alive(pid: int | None) -> bool:
         return True
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Todos
+# ---------------------------------------------------------------------------
+
+
+def default_todos() -> dict[str, Any]:
+    return {"version": 1, "next_sequence": 1, "updated_at": None, "todos": []}
+
+
+def _clean_text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def normalize_todo(item: dict[str, Any], index: int) -> dict[str, Any]:
+    todo_id = _clean_text(item.get("id")) or f"T-{index:04d}"
+    status = _clean_text(item.get("status"))
+    if status not in TODO_STATUSES:
+        status = "pending"
+    priority = _clean_text(item.get("priority"))
+    if priority not in TODO_PRIORITIES:
+        priority = "medium"
+    tags = item.get("tags")
+    if not isinstance(tags, list):
+        tags = []
+    return {
+        "id": todo_id,
+        "title": _clean_text(item.get("title")),
+        "description": _clean_text(item.get("description")),
+        "status": status,
+        "priority": priority,
+        "source": _clean_text(item.get("source")) or "self",
+        "due_at": item.get("due_at") or None,
+        "created_at": item.get("created_at") or None,
+        "updated_at": item.get("updated_at") or None,
+        "started_at": item.get("started_at") or None,
+        "completed_at": item.get("completed_at") or None,
+        "cancelled_at": item.get("cancelled_at") or None,
+        "tags": [str(tag).strip() for tag in tags if str(tag).strip()],
+        "notes": _clean_text(item.get("notes")),
+    }
+
+
+def load_todos() -> dict[str, Any]:
+    data = load_json(TODOS_FILE, None)
+    if not isinstance(data, dict):
+        return default_todos()
+    raw_items = data.get("todos")
+    if not isinstance(raw_items, list):
+        raw_items = []
+    todos = [normalize_todo(item, index) for index, item in enumerate(raw_items) if isinstance(item, dict)]
+
+    sequence = data.get("next_sequence")
+    try:
+        next_sequence = max(1, int(sequence))
+    except (TypeError, ValueError):
+        next_sequence = 1
+    for todo in todos:
+        match = re.fullmatch(r"T-(\d+)", todo["id"], re.IGNORECASE)
+        if match:
+            next_sequence = max(next_sequence, int(match.group(1)) + 1)
+    return {
+        "version": 1,
+        "next_sequence": next_sequence,
+        "updated_at": data.get("updated_at"),
+        "todos": todos,
+    }
+
+
+def save_todos(data: dict[str, Any]) -> None:
+    data["version"] = 1
+    write_json_atomic(TODOS_FILE, data)
+
+
+def mutate_todos(mutator) -> tuple[dict[str, Any], Any]:
+    with file_lock(TODO_LOCK_FILE):
+        data = load_todos()
+        result = mutator(data)
+        data["updated_at"] = iso(now())
+        save_todos(data)
+    return data, result
+
+
+def find_todo(data: dict[str, Any], raw_id: str) -> dict[str, Any]:
+    wanted = _clean_text(raw_id)
+    if wanted.isdigit():
+        wanted = f"T-{int(wanted):04d}"
+    for todo in data.get("todos", []):
+        if str(todo.get("id", "")).lower() == wanted.lower():
+            return todo
+    raise KeyError(raw_id)
+
+
+def parse_todo_due(value: str | None) -> str | None:
+    text = _clean_text(value)
+    if not text or text.lower() in {"none", "clear", "-"}:
+        return None
+    lowered = text.lower()
+    if lowered == "now":
+        return iso(now())
+    candidate = text[3:].strip() if lowered.startswith("in ") else text
+    try:
+        parsed = parse_datetime(candidate)
+    except ValueError:
+        try:
+            parsed = now() + parse_duration(candidate)
+        except argparse.ArgumentTypeError as exc:
+            raise ValueError(f"无法识别的时间: {value!r}") from exc
+    if parsed is None:
+        return None
+    return iso(parsed)
+
+
+def parse_todo_time(value: str | None) -> str | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered == "now":
+        return iso(now())
+    candidate = text[3:].strip() if lowered.startswith("in ") else text
+    try:
+        parsed = parse_datetime(candidate)
+    except ValueError:
+        try:
+            parsed = now() + parse_duration(candidate)
+        except argparse.ArgumentTypeError as exc:
+            raise ValueError(f"无法识别的时间: {value!r}") from exc
+    return iso(parsed) if parsed else None
+
+
+def create_todo(
+    data: dict[str, Any],
+    title: str,
+    description: str = "",
+    due_at: str | None = None,
+    priority: str = "medium",
+    source: str = "self",
+    tags: list[str] | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    title = _clean_text(title)
+    if not title:
+        raise ValueError("待办标题不能为空")
+    sequence = max(1, int(data.get("next_sequence", 1)))
+    existing = {str(todo.get("id", "")).lower() for todo in data.get("todos", [])}
+    while True:
+        todo_id = f"T-{sequence:04d}"
+        sequence += 1
+        if todo_id.lower() not in existing:
+            break
+    data["next_sequence"] = sequence
+    timestamp = iso(now())
+    todo = {
+        "id": todo_id,
+        "title": title,
+        "description": _clean_text(description),
+        "status": "pending",
+        "priority": priority if priority in TODO_PRIORITIES else "medium",
+        "source": _clean_text(source) or "self",
+        "due_at": due_at,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "started_at": None,
+        "completed_at": None,
+        "cancelled_at": None,
+        "tags": [str(tag).strip() for tag in (tags or []) if str(tag).strip()],
+        "notes": _clean_text(notes),
+    }
+    data.setdefault("todos", []).append(todo)
+    return todo
+
+
+def update_todo_status(todo: dict[str, Any], status: str, at: str | None = None) -> None:
+    if status not in TODO_STATUSES:
+        raise ValueError(f"未知状态: {status}")
+    timestamp = at or iso(now())
+    todo["status"] = status
+    todo["updated_at"] = timestamp
+    if status == "in_progress":
+        todo["started_at"] = todo.get("started_at") or timestamp
+        todo["completed_at"] = None
+        todo["cancelled_at"] = None
+    elif status == "done":
+        todo["started_at"] = todo.get("started_at") or timestamp
+        todo["completed_at"] = timestamp
+        todo["cancelled_at"] = None
+    elif status == "cancelled":
+        todo["completed_at"] = None
+        todo["cancelled_at"] = timestamp
+    else:
+        todo["completed_at"] = None
+        todo["cancelled_at"] = None
+
+
+def todo_is_open(todo: dict[str, Any]) -> bool:
+    return todo.get("status") in TODO_OPEN_STATUSES
+
+
+def todo_due_datetime(todo: dict[str, Any]) -> datetime | None:
+    try:
+        return parse_datetime(todo.get("due_at"))
+    except ValueError:
+        return None
+
+
+def todo_due_state(todo: dict[str, Any]) -> str:
+    status = todo.get("status")
+    if status == "done":
+        return "done"
+    if status == "cancelled":
+        return "cancelled"
+    due = todo_due_datetime(todo)
+    if due is None:
+        return "none"
+    current = now()
+    if due <= current:
+        return "overdue"
+    if due.date() == current.date():
+        return "today"
+    if due <= current + timedelta(days=7):
+        return "soon"
+    return "upcoming"
+
+
+def human_span(seconds: int) -> str:
+    seconds = abs(int(seconds))
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}天")
+    if hours:
+        parts.append(f"{hours}小时")
+    if minutes and not days:
+        parts.append(f"{minutes}分钟")
+    return " ".join(parts) or "不到1分钟"
+
+
+def todo_due_text(todo: dict[str, Any]) -> str:
+    if todo.get("status") == "done":
+        return "已完成"
+    if todo.get("status") == "cancelled":
+        return "已取消"
+    due = todo_due_datetime(todo)
+    if due is None:
+        return "无截止"
+    seconds = int((due - now()).total_seconds())
+    if seconds < 0:
+        return f"逾期 {human_span(seconds)}"
+    if seconds == 0:
+        return "刚刚到期"
+    return f"{human_span(seconds)}后"
+
+
+def todo_sort_key(todo: dict[str, Any]) -> tuple[Any, ...]:
+    due = todo_due_datetime(todo)
+    due_value = due.timestamp() if due else float("inf")
+    return (
+        0 if todo_is_open(todo) else 1,
+        due_value,
+        TODO_PRIORITY_RANK.get(str(todo.get("priority")), 1),
+        str(todo.get("created_at") or ""),
+        str(todo.get("id") or ""),
+    )
+
+
+def completed_sort_key(todo: dict[str, Any]) -> str:
+    return str(todo.get("completed_at") or todo.get("cancelled_at") or todo.get("updated_at") or "")
+
+
+def todo_summary(data: dict[str, Any]) -> dict[str, Any]:
+    items = data.get("todos", [])
+    open_items = [todo for todo in items if todo_is_open(todo)]
+    overdue = [todo for todo in open_items if todo_due_state(todo) == "overdue"]
+    today = [todo for todo in open_items if todo_due_state(todo) == "today"]
+    soon = [todo for todo in open_items if todo_due_state(todo) == "soon"]
+    completed = [todo for todo in items if todo.get("status") == "done"]
+    cancelled = [todo for todo in items if todo.get("status") == "cancelled"]
+    due_values = [todo_due_datetime(todo) for todo in open_items]
+    next_due = min((value for value in due_values if value is not None), default=None)
+    return {
+        "total": len(items),
+        "open": len(open_items),
+        "overdue": len(overdue),
+        "today": len(today),
+        "soon": len(soon),
+        "completed": len(completed),
+        "cancelled": len(cancelled),
+        "next_due_at": iso(next_due) if next_due else None,
+        "next_due_text": human_delta(next_due),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+def todo_prompt_summary(limit: int = 15) -> str:
+    data = load_todos()
+    items = data.get("todos", [])
+    if not items:
+        return (
+            "【待办清单】当前为空。若本班次产生需要跨班次跟踪的事项，"
+            "用 `.opencode/bin/edward todo add --title ... --due ...` 登记。\n"
+        )
+    summary = todo_summary(data)
+    open_items = sorted((todo for todo in items if todo_is_open(todo)), key=todo_sort_key)
+    lines = [
+        f"【待办清单】未完成 {summary['open']} 项（逾期 {summary['overdue']}，"
+        f"今日到期 {summary['today']}，7 天内 {summary['soon']}）；"
+        f"已完成 {summary['completed']}，已取消 {summary['cancelled']}。"
+    ]
+    for todo in open_items[:limit]:
+        due = todo.get("due_at")
+        due_label = f"截止 {due}（{todo_due_text(todo)}）" if due else "无截止"
+        lines.append(
+            f"- {todo['id']} [{TODO_STATUS_LABELS.get(todo['status'], todo['status'])}/"
+            f"{TODO_PRIORITY_LABELS.get(todo['priority'], todo['priority'])}] "
+            f"{todo['title']} · {due_label} · 来源 {todo['source']}"
+        )
+    if len(open_items) > limit:
+        lines.append(f"- ... 其余 {len(open_items) - limit} 项请运行 `.opencode/bin/edward todo list` 查看。")
+    lines.append(
+        "待办按 due_at 与优先级推进；登记/状态变更统一用 "
+        "`.opencode/bin/edward todo add|update|start|done|delete`，"
+        "完成时自动记录 completed_at。若最早截止时间早于下次默认唤醒，"
+        "收工前用 `edward schedule --at` 把下一次上班安排在截止前。"
+    )
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -963,13 +1315,19 @@ def build_prompt(
         intro = "上班。本次是定时唤醒。\n"
 
     intro += (
-        "\n请读取 edward/codex/index.md、goal.md、plan.md、current_state.md、notebook.md、"
-        "相关 knowledge 和最近一份 report，判断当前阶段并推进本班次工作。\n"
-        "\n收工前必须完成：\n"
+        "\n请读取 edward/codex/index.md、goal.md、plan.md、current_state.md、"
+        "edward/execution/todos.json、notebook.md、相关 knowledge 和最近一份 report，"
+        "判断当前阶段并推进本班次工作。\n"
+        "\n"
+        + todo_prompt_summary()
+        + "\n收工前必须完成：\n"
         "1. 更新 edward/execution/current_state.md（自然语言，不要写调度解析格式）。\n"
-        "2. 写 edward/execution/reports/<EDWARD_RUN_ID>.md，包含进度、完成情况、阻塞项、待决策项。\n"
-        "3. 用 python3 .opencode/scripts/edward.py schedule --in <时长> 或 --at <时间> 声明下次唤醒。\n"
-        "4. 如果目标达成，使用独立 final-report 模板写 reports/final-<EDWARD_RUN_ID>.md，并等待人类在 report-reply 验收。\n"
+        "2. 更新 edward/execution/todos.json：完成项 done、进行项 in_progress、新增需求登记，"
+        "状态变更统一通过 CLI 写入，避免手改 JSON 造成损坏。\n"
+        "3. 写 edward/execution/reports/<EDWARD_RUN_ID>.md，包含进度、完成情况、阻塞项、待决策项。\n"
+        "4. 用 python3 .opencode/scripts/edward.py schedule --in <时长> 或 --at <时间> 声明下次唤醒；"
+        "若待办最早截止早于默认唤醒，优先按待办截止时间安排。\n"
+        "5. 如果目标达成，使用独立 final-report 模板写 reports/final-<EDWARD_RUN_ID>.md，并等待人类在 report-reply 验收。\n"
     )
 
     if reason == "interval" and scheduler_data.get("schedule_source") == "default":
@@ -1194,6 +1552,250 @@ def apply_run_result(result: RunResult, revision_before: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Todo commands
+# ---------------------------------------------------------------------------
+
+
+def print_todo_line(todo: dict[str, Any]) -> None:
+    status = TODO_STATUS_LABELS.get(str(todo.get("status")), str(todo.get("status") or "—"))
+    priority = TODO_PRIORITY_LABELS.get(str(todo.get("priority")), str(todo.get("priority") or "—"))
+    due = todo.get("due_at") or "无截止"
+    due_text = todo_due_text(todo) if todo.get("due_at") and todo_is_open(todo) else ""
+    suffix = f"（{due_text}）" if due_text else ""
+    print(
+        f"{todo.get('id')}  [{status}/{priority}]  {todo.get('title')}\n"
+        f"    due={due}{suffix} source={todo.get('source') or '—'} "
+        f"created={todo.get('created_at') or '—'} updated={todo.get('updated_at') or '—'}"
+        + (f" completed={todo.get('completed_at')}" if todo.get("completed_at") else "")
+    )
+    description = str(todo.get("description") or "").strip()
+    if description:
+        print(f"    desc: {description}")
+    notes = str(todo.get("notes") or "").strip()
+    if notes:
+        print(f"    notes: {notes}")
+    tags = todo.get("tags") or []
+    if tags:
+        print(f"    tags: {', '.join(str(tag) for tag in tags)}")
+
+
+def todo_cli_payload(data: dict[str, Any], items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    selected = items if items is not None else data.get("todos", [])
+    return {"summary": todo_summary(data), "todos": selected}
+
+
+def cmd_todo_list(args: argparse.Namespace) -> int:
+    data = load_todos()
+    items = data.get("todos", [])
+    if args.status:
+        selected = sorted((todo for todo in items if todo.get("status") == args.status), key=todo_sort_key)
+    elif args.all:
+        selected = sorted(items, key=todo_sort_key)
+    else:
+        selected = sorted((todo for todo in items if todo_is_open(todo)), key=todo_sort_key)
+
+    if args.json:
+        print(json.dumps(todo_cli_payload(data, selected), ensure_ascii=False, indent=2))
+        return 0
+
+    summary = todo_summary(data)
+    print(
+        f"待办：未完成 {summary['open']}（逾期 {summary['overdue']}，今日 {summary['today']}，"
+        f"7 天内 {summary['soon']}），已完成 {summary['completed']}，已取消 {summary['cancelled']}。"
+    )
+    if summary.get("next_due_at"):
+        print(f"最近截止：{summary['next_due_at']}（{summary['next_due_text']}）")
+    if not selected:
+        print("没有匹配的待办。")
+        return 0
+    print("")
+    for todo in selected:
+        print_todo_line(todo)
+        print("")
+    return 0
+
+
+def cmd_todo_add(args: argparse.Namespace) -> int:
+    try:
+        due_at = parse_todo_due(args.due)
+    except ValueError as exc:
+        print(f"[edward] {exc}", file=sys.stderr)
+        return 2
+    try:
+        data, todo = mutate_todos(
+            lambda current: create_todo(
+                current,
+                title=args.title,
+                description=args.description or "",
+                due_at=due_at,
+                priority=args.priority,
+                source=args.source,
+                tags=args.tag or [],
+                notes=args.notes or "",
+            )
+        )
+    except ValueError as exc:
+        print(f"[edward] {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"summary": todo_summary(data), "todo": todo}, ensure_ascii=False, indent=2))
+    else:
+        print("已创建待办：")
+        print_todo_line(todo)
+    log_event("todo_add", todo_id=todo["id"], title=todo["title"], due_at=todo.get("due_at"))
+    return 0
+
+
+def cmd_todo_update(args: argparse.Namespace) -> int:
+    try:
+        due_value = parse_todo_due(args.due) if args.due is not None else None
+        completed_at = parse_todo_time(args.completed_at) if args.completed_at else None
+    except ValueError as exc:
+        print(f"[edward] {exc}", file=sys.stderr)
+        return 2
+
+    changed_fields = [
+        args.title,
+        args.description,
+        args.notes,
+        args.due,
+        args.priority,
+        args.status,
+        args.source,
+        args.add_tag,
+        args.remove_tag,
+        args.completed_at,
+    ]
+    if not any(value not in (None, []) for value in changed_fields):
+        print("[edward] 没有指定要更新的字段，使用 --help 查看可用参数。", file=sys.stderr)
+        return 2
+
+    def mutate(current: dict[str, Any]) -> dict[str, Any]:
+        todo = find_todo(current, args.todo_id)
+        timestamp = iso(now())
+        if args.title is not None:
+            title = _clean_text(args.title)
+            if not title:
+                raise ValueError("待办标题不能为空")
+            todo["title"] = title
+        if args.description is not None:
+            todo["description"] = _clean_text(args.description)
+        if args.notes is not None:
+            todo["notes"] = _clean_text(args.notes)
+        if args.due is not None:
+            todo["due_at"] = due_value
+        if args.priority is not None:
+            todo["priority"] = args.priority
+        if args.source is not None:
+            todo["source"] = args.source
+        if args.add_tag:
+            existing = {str(tag).lower() for tag in todo.get("tags", [])}
+            for tag in args.add_tag:
+                cleaned = _clean_text(tag)
+                if cleaned and cleaned.lower() not in existing:
+                    todo.setdefault("tags", []).append(cleaned)
+                    existing.add(cleaned.lower())
+        if args.remove_tag:
+            removing = {_clean_text(tag).lower() for tag in args.remove_tag if _clean_text(tag)}
+            todo["tags"] = [tag for tag in todo.get("tags", []) if str(tag).lower() not in removing]
+        if args.status is not None:
+            update_todo_status(todo, args.status, at=completed_at)
+        elif completed_at is not None:
+            todo["completed_at"] = completed_at
+        todo["updated_at"] = timestamp
+        return todo
+
+    try:
+        data, todo = mutate_todos(mutate)
+    except KeyError:
+        print(f"[edward] 找不到待办: {args.todo_id}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"[edward] {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"summary": todo_summary(data), "todo": todo}, ensure_ascii=False, indent=2))
+    else:
+        print("已更新待办：")
+        print_todo_line(todo)
+    log_event("todo_update", todo_id=todo["id"], status=todo.get("status"))
+    return 0
+
+
+def cmd_todo_status_change(args: argparse.Namespace) -> int:
+    target_status = getattr(args, "target_status")
+    try:
+        at = parse_todo_time(getattr(args, "at", None))
+    except ValueError as exc:
+        print(f"[edward] {exc}", file=sys.stderr)
+        return 2
+
+    def mutate(current: dict[str, Any]) -> dict[str, Any]:
+        todo = find_todo(current, args.todo_id)
+        update_todo_status(todo, target_status, at=at)
+        return todo
+
+    try:
+        data, todo = mutate_todos(mutate)
+    except KeyError:
+        print(f"[edward] 找不到待办: {args.todo_id}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"[edward] {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"summary": todo_summary(data), "todo": todo}, ensure_ascii=False, indent=2))
+    else:
+        print(f"待办状态已更新为 {TODO_STATUS_LABELS.get(target_status, target_status)}：")
+        print_todo_line(todo)
+    log_event("todo_status", todo_id=todo["id"], status=target_status)
+    return 0
+
+
+def cmd_todo_done(args: argparse.Namespace) -> int:
+    args.target_status = "done"
+    return cmd_todo_status_change(args)
+
+
+def cmd_todo_start(args: argparse.Namespace) -> int:
+    args.target_status = "in_progress"
+    return cmd_todo_status_change(args)
+
+
+def cmd_todo_delete(args: argparse.Namespace) -> int:
+    def mutate(current: dict[str, Any]) -> dict[str, Any]:
+        todo = find_todo(current, args.todo_id)
+        current["todos"] = [item for item in current.get("todos", []) if item is not todo]
+        return todo
+
+    try:
+        data, todo = mutate_todos(mutate)
+    except KeyError:
+        print(f"[edward] 找不到待办: {args.todo_id}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"summary": todo_summary(data), "deleted": todo}, ensure_ascii=False, indent=2))
+    else:
+        print(f"已删除待办 {todo['id']}: {todo['title']}")
+    log_event("todo_delete", todo_id=todo["id"])
+    return 0
+
+
+def cmd_todo_show(args: argparse.Namespace) -> int:
+    data = load_todos()
+    try:
+        todo = find_todo(data, args.todo_id)
+    except KeyError:
+        print(f"[edward] 找不到待办: {args.todo_id}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(todo, ensure_ascii=False, indent=2))
+    else:
+        print_todo_line(todo)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -1306,6 +1908,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         }
     except Exception as exc:  # noqa: BLE001
         ui_payload = {"enabled": False, "error": str(exc)}
+    todo_data = load_todos()
+    todo_stats = todo_summary(todo_data)
 
     payload = {
         "project_root": str(PROJECT_ROOT),
@@ -1316,6 +1920,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "pending_replies": pending,
         "report_count": len(list(REPORTS_DIR.glob("*.md"))),
         "reply_count": len(current_replies),
+        "todos": todo_stats,
         "dashboard": {
             "path": str(DASHBOARD_FILE),
             "updated_at": dashboard_updated,
@@ -1348,6 +1953,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  retry in:  {human_delta(retry_at)}")
     print(f"  last run:  {scheduler.get('last_run_id') or '无'}")
     print(f"  reports:   {payload['report_count']}  replies: {payload['reply_count']}")
+    print(
+        "  todos:     "
+        f"open={todo_stats['open']} overdue={todo_stats['overdue']} "
+        f"today={todo_stats['today']} done={todo_stats['completed']} "
+        f"next={todo_stats.get('next_due_at') or '未设置'}"
+    )
     print(
         "  dashboard: "
         f"{len(dashboard_metrics)} metrics, "
@@ -1698,6 +2309,10 @@ textarea{min-height:108px;resize:vertical}
 .list{list-style:none;margin:0;padding:0;display:grid;gap:8px}
 .list li{display:flex;gap:8px;align-items:flex-start;font-size:12.5px;color:#475569}
 .list li::before{content:"";width:6px;height:6px;border-radius:50%;background:#93c5fd;margin-top:7px;flex:0 0 auto}
+.todo-title{font-weight:650;color:var(--ink)}
+.todo-desc{margin-top:3px;color:#475569;white-space:pre-wrap;overflow-wrap:anywhere}
+.todo-notes{margin-top:3px;color:var(--muted);font-size:11.5px;white-space:pre-wrap}
+.todo-tags{margin-top:6px;display:flex;gap:4px;flex-wrap:wrap}
 .login{max-width:440px;margin:60px auto}
 .doc-layout{display:grid;grid-template-columns:270px minmax(0,1fr);gap:16px;align-items:start}
 .doc-nav{display:grid;gap:3px}
@@ -2188,11 +2803,183 @@ def ui_format_duration(seconds: Any) -> str:
     return f"{sec}s"
 
 
+def ui_todo_badge(todo: dict[str, Any], kind: str = "status") -> str:
+    if kind == "priority":
+        label = TODO_PRIORITY_LABELS.get(str(todo.get("priority")), str(todo.get("priority") or "—"))
+        badge = TODO_PRIORITY_BADGES.get(str(todo.get("priority")), "")
+        return f'<span class="badge {badge}">{html_lib.escape(label)}优先级</span>'
+    label = TODO_STATUS_LABELS.get(str(todo.get("status")), str(todo.get("status") or "—"))
+    badge = TODO_STATUS_BADGES.get(str(todo.get("status")), "")
+    return f'<span class="badge {badge}">{html_lib.escape(label)}</span>'
+
+
+def ui_todo_due_markup(todo: dict[str, Any]) -> str:
+    state = todo_due_state(todo)
+    due = todo.get("due_at")
+    if not due:
+        return '<span class="muted">无截止</span>'
+    badge = ""
+    if state == "overdue":
+        badge = "rose"
+    elif state in {"today", "soon"}:
+        badge = "amber"
+    elif state == "done":
+        badge = "green"
+    text = todo_due_text(todo) if state not in {"done", "cancelled"} else ""
+    due_text = html_lib.escape(str(due))
+    if text:
+        return (
+            f'<div><span class="badge {badge}">{html_lib.escape(text)}</span></div>'
+            f'<div class="muted small">{due_text}</div>'
+        )
+    return f'<div class="muted small">{due_text}</div>'
+
+
+def ui_todo_open_table(open_items: list[dict[str, Any]]) -> str:
+    if not open_items:
+        return '<div class="empty">当前没有未完成待办。</div>'
+    rows = []
+    for todo in open_items:
+        description = str(todo.get("description") or "").strip()
+        notes = str(todo.get("notes") or "").strip()
+        detail = ""
+        if description:
+            detail += f'<div class="todo-desc">{html_lib.escape(description)}</div>'
+        if notes:
+            detail += f'<div class="todo-notes">备注：{html_lib.escape(notes)}</div>'
+        tags = todo.get("tags") or []
+        tag_html = "".join(
+            f'<span class="badge">{html_lib.escape(str(tag))}</span> ' for tag in tags
+        )
+        tag_block = f'<div class="todo-tags">{tag_html}</div>' if tag_html else ""
+        rows.append(
+            "<tr>"
+            f"<td>{ui_todo_badge(todo)}</td>"
+            f"<td>{ui_todo_badge(todo, 'priority')}</td>"
+            f"<td><div class='todo-title'>{html_lib.escape(str(todo.get('title') or '—'))}</div>"
+            f"{detail}{tag_block}</td>"
+            f"<td>{ui_todo_due_markup(todo)}</td>"
+            f"<td><div>{html_lib.escape(str(todo.get('source') or '—'))}</div>"
+            f"<div class='muted small'>{html_lib.escape(str(todo.get('created_at') or '—'))}</div></td>"
+            f"<td><code>{html_lib.escape(str(todo.get('id') or '—'))}</code></td>"
+            "</tr>"
+        )
+    return (
+        '<div class="table-wrap"><table>'
+        "<thead><tr><th>状态</th><th>优先级</th><th>待办</th><th>截止</th><th>来源 / 创建</th><th>ID</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def ui_todo_history_table(history: list[dict[str, Any]]) -> str:
+    if not history:
+        return '<div class="empty">还没有完成或取消的待办。</div>'
+    rows = []
+    for todo in history[:50]:
+        finish = todo.get("completed_at") or todo.get("cancelled_at") or todo.get("updated_at")
+        rows.append(
+            "<tr>"
+            f"<td>{ui_todo_badge(todo)}</td>"
+            f"<td>{html_lib.escape(str(todo.get('title') or '—'))}</td>"
+            f"<td>{html_lib.escape(str(finish or '—'))}</td>"
+            f"<td>{html_lib.escape(str(todo.get('source') or '—'))}</td>"
+            f"<td><code>{html_lib.escape(str(todo.get('id') or '—'))}</code></td>"
+            "</tr>"
+        )
+    return (
+        '<div class="table-wrap"><table>'
+        "<thead><tr><th>状态</th><th>待办</th><th>完成 / 取消时间</th><th>来源</th><th>ID</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def ui_todos_payload() -> dict[str, Any]:
+    data = load_todos()
+    items: list[dict[str, Any]] = []
+    for todo in data.get("todos", []):
+        enriched = dict(todo)
+        enriched["due_state"] = todo_due_state(todo)
+        enriched["due_text"] = todo_due_text(todo)
+        enriched["status_label"] = TODO_STATUS_LABELS.get(todo["status"], todo["status"])
+        enriched["priority_label"] = TODO_PRIORITY_LABELS.get(todo["priority"], todo["priority"])
+        items.append(enriched)
+    items.sort(key=todo_sort_key)
+    return {
+        "generated_at": iso(now()),
+        "summary": todo_summary(data),
+        "todos": items,
+    }
+
+
+def ui_todo_summary_card(config: dict[str, Any]) -> str:
+    data = load_todos()
+    summary = todo_summary(data)
+    open_items = sorted((todo for todo in data.get("todos", []) if todo_is_open(todo)), key=todo_sort_key)
+    rows = []
+    for todo in open_items[:5]:
+        rows.append(
+            "<li>"
+            f"{ui_todo_badge(todo)} {html_lib.escape(str(todo.get('title') or '—'))} "
+            f"<span class='muted small'>· {html_lib.escape(todo_due_text(todo))}"
+            f"{' · ' + html_lib.escape(str(todo.get('due_at'))) if todo.get('due_at') else ''}</span>"
+            "</li>"
+        )
+    body = (
+        f'<ul class="list">{"".join(rows)}</ul>'
+        if rows
+        else '<div class="empty">当前没有未完成待办。</div>'
+    )
+    return f"""
+    <div class="card">
+      <h3>待办清单
+        <span class="muted small">未完成 {summary['open']} · 逾期 {summary['overdue']} · 今日 {summary['today']} · 已完成 {summary['completed']}</span>
+      </h3>
+      {body}
+      <div style="margin-top:12px"><a class="btn" href="{ui_url(config['base_path'], '/todos')}">查看全部待办 →</a></div>
+    </div>
+    """
+
+
+def ui_page_todos(config: dict[str, Any]) -> str:
+    data = load_todos()
+    summary = todo_summary(data)
+    open_items = sorted((todo for todo in data.get("todos", []) if todo_is_open(todo)), key=todo_sort_key)
+    history = sorted(
+        (todo for todo in data.get("todos", []) if not todo_is_open(todo)),
+        key=completed_sort_key,
+        reverse=True,
+    )
+    next_due = summary.get("next_due_at") or "未设置"
+    updated = summary.get("updated_at") or "—"
+    content = f"""
+    <div class="page-head">
+      <div><h2>待办清单</h2><div class="sub">Edward 自行梳理与人类要求产生的 todo · 数据源 edward/execution/todos.json</div></div>
+      <a class="btn" href="{ui_url(config['base_path'], '/timeline')}">执行时间</a>
+    </div>
+    <div class="grid">
+      <div class="stat"><div class="label">未完成</div><div class="value">{summary['open']}</div><div class="hint">总计 {summary['total']} 项</div></div>
+      <div class="stat"><div class="label">逾期</div><div class="value">{summary['overdue']}</div><div class="hint">今日到期 {summary['today']} 项</div></div>
+      <div class="stat"><div class="label">最近截止</div><div class="value" style="font-size:14px">{html_lib.escape(str(next_due))}</div><div class="hint">{html_lib.escape(str(summary.get('next_due_text') or '未设置'))}</div></div>
+      <div class="stat"><div class="label">已完成</div><div class="value">{summary['completed']}</div><div class="hint">已取消 {summary['cancelled']} 项</div></div>
+    </div>
+    <div class="card">
+      <h3>未完成 <span class="muted small">按截止时间与优先级排序 · 最后更新 {html_lib.escape(str(updated))}</span></h3>
+      {ui_todo_open_table(open_items)}
+    </div>
+    <div class="card">
+      <h3>完成记录 <span class="muted small">最近 50 项</span></h3>
+      {ui_todo_history_table(history)}
+    </div>
+    """
+    return ui_layout(config, "待办清单", "/todos", content)
+
+
 def ui_layout(config: dict[str, Any], title: str, active: str, content: str, status: dict[str, Any] | None = None) -> str:
     status = status or ui_status_payload()
     base_path = config["base_path"]
     nav_items = [
         ("/", "看板"),
+        ("/todos", "待办"),
         ("/timeline", "执行时间"),
         ("/plan", "计划"),
         ("/docs", "文档"),
@@ -2275,6 +3062,7 @@ def ui_layout(config: dict[str, Any], title: str, active: str, content: str, sta
 
 def ui_page_dashboard(config: dict[str, Any]) -> str:
     base_path = config["base_path"]
+    todo_card = ui_todo_summary_card(config)
     custom_index = Path(config["document_root"]) / "index.html"
     if custom_index.exists():
         content = f"""
@@ -2282,6 +3070,7 @@ def ui_page_dashboard(config: dict[str, Any]) -> str:
           <div><h2>看板</h2><div class="sub">自定义看板由 Edward 生成 · 数据来自 dashboard/data/latest.json</div></div>
           <a class="btn" href="{ui_url(base_path, '/custom/')}" target="_blank" rel="noreferrer">新窗口打开 ↗</a>
         </div>
+        {todo_card}
         <div class="iframe-wrap"><iframe class="dash-frame" src="{ui_url(base_path, '/custom/')}" loading="lazy"></iframe></div>
         """
         return ui_layout(config, "看板", "/", content)
@@ -2325,6 +3114,7 @@ def ui_page_dashboard(config: dict[str, Any]) -> str:
       <div><h2>看板</h2><div class="sub">当前为默认看板 · 自定义页面放在 dashboard/index.html</div></div>
       <a class="btn" href="{ui_url(base_path, '/timeline')}">查看执行时间</a>
     </div>
+    {todo_card}
     {latest_html}
     {body}
     """
@@ -2911,6 +3701,10 @@ def ui_make_handler(config: dict[str, Any], csrf: str):
                 self._send_html(ui_page_dashboard(config))
                 return
 
+            if subpath == "/todos":
+                self._send_html(ui_page_todos(config))
+                return
+
             if subpath == "/timeline":
                 self._send_html(ui_page_timeline(config))
                 return
@@ -2976,6 +3770,10 @@ def ui_make_handler(config: dict[str, Any], csrf: str):
                         "latest": load_json(DASHBOARD_LATEST_FILE, {}),
                     }
                 )
+                return
+
+            if subpath == "/api/todos":
+                self._send_json(ui_todos_payload())
                 return
 
             if subpath == "/api/reports":
@@ -3201,6 +3999,63 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_parser = subparsers.add_parser("dashboard", help="从最新数据重新渲染看板")
     dashboard_parser.add_argument("--json", action="store_true", help="输出 latest.json")
     dashboard_parser.set_defaults(func=cmd_dashboard)
+
+    todo_parser = subparsers.add_parser("todo", help="管理跨班次待办清单")
+    todo_sub = todo_parser.add_subparsers(dest="todo_command", required=True)
+
+    todo_list = todo_sub.add_parser("list", help="列出待办")
+    todo_list.add_argument("--all", action="store_true", help="包含已完成/已取消")
+    todo_list.add_argument("--status", choices=TODO_STATUSES, help="只显示指定状态")
+    todo_list.add_argument("--json", action="store_true", help="输出 JSON")
+    todo_list.set_defaults(func=cmd_todo_list)
+
+    todo_add = todo_sub.add_parser("add", help="新增待办")
+    todo_add.add_argument("--title", "-t", required=True, help="待办标题")
+    todo_add.add_argument("--description", "-d", default="", help="详细描述")
+    todo_add.add_argument("--due", help="截止时间：ISO、now、2h、2d、in 2d；留空表示无截止")
+    todo_add.add_argument("--priority", choices=TODO_PRIORITIES, default="medium", help="优先级，默认 medium")
+    todo_add.add_argument("--source", choices=("self", "human"), default="self", help="来源，默认 self")
+    todo_add.add_argument("--tag", action="append", default=[], help="标签，可重复")
+    todo_add.add_argument("--notes", default="", help="备注")
+    todo_add.add_argument("--json", action="store_true", help="输出 JSON")
+    todo_add.set_defaults(func=cmd_todo_add)
+
+    todo_update = todo_sub.add_parser("update", help="更新待办字段或状态")
+    todo_update.add_argument("todo_id", help="待办 ID，如 T-0001 或 1")
+    todo_update.add_argument("--title", "-t", help="新标题")
+    todo_update.add_argument("--description", "-d", help="新描述；传空字符串清空")
+    todo_update.add_argument("--notes", help="新备注；传空字符串清空")
+    todo_update.add_argument("--due", help="新截止时间，或 clear 清空")
+    todo_update.add_argument("--priority", choices=TODO_PRIORITIES, help="新优先级")
+    todo_update.add_argument("--status", choices=TODO_STATUSES, help="新状态")
+    todo_update.add_argument("--source", choices=("self", "human"), help="新来源")
+    todo_update.add_argument("--add-tag", action="append", default=[], help="追加标签，可重复")
+    todo_update.add_argument("--remove-tag", action="append", default=[], help="移除标签，可重复")
+    todo_update.add_argument("--completed-at", help="状态改为 done 时使用的完成时间")
+    todo_update.add_argument("--json", action="store_true", help="输出 JSON")
+    todo_update.set_defaults(func=cmd_todo_update)
+
+    todo_done = todo_sub.add_parser("done", help="标记待办完成")
+    todo_done.add_argument("todo_id", help="待办 ID")
+    todo_done.add_argument("--at", help="完成时间，默认当前时间")
+    todo_done.add_argument("--json", action="store_true", help="输出 JSON")
+    todo_done.set_defaults(func=cmd_todo_done)
+
+    todo_start = todo_sub.add_parser("start", help="标记待办进行中")
+    todo_start.add_argument("todo_id", help="待办 ID")
+    todo_start.add_argument("--at", help="开始时间，默认当前时间")
+    todo_start.add_argument("--json", action="store_true", help="输出 JSON")
+    todo_start.set_defaults(func=cmd_todo_start)
+
+    todo_delete = todo_sub.add_parser("delete", help="删除待办")
+    todo_delete.add_argument("todo_id", help="待办 ID")
+    todo_delete.add_argument("--json", action="store_true", help="输出 JSON")
+    todo_delete.set_defaults(func=cmd_todo_delete)
+
+    todo_show = todo_sub.add_parser("show", help="查看单个待办详情")
+    todo_show.add_argument("todo_id", help="待办 ID")
+    todo_show.add_argument("--json", action="store_true", help="输出 JSON")
+    todo_show.set_defaults(func=cmd_todo_show)
 
     run_parser = subparsers.add_parser("run-now", help="立即触发一个班次")
     run_parser.add_argument("--dry-run", action="store_true", help="只打印将执行的命令")
