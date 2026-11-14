@@ -29,7 +29,9 @@ RESOURCE_ROOT = PROJECT_ROOT
 DIST_DIR = PROJECT_ROOT / "dist"
 BUILD_DIR = PROJECT_ROOT / "build" / "macos"
 PAYLOAD_ROOT = BUILD_DIR / "payload"
-PAYLOAD_IGNORE = shutil.ignore_patterns(".DS_Store", "__pycache__", "*.pyc", "*.pyo")
+PAYLOAD_IGNORE = shutil.ignore_patterns(
+    ".DS_Store", ".gitkeep", "__pycache__", "*.pyc", "*.pyo"
+)
 NATIVE_DIST = BUILD_DIR / "native-dist"
 NATIVE_WORK = BUILD_DIR / "native-work"
 NATIVE_SPEC = BUILD_DIR / "native-spec"
@@ -100,6 +102,9 @@ def prepare_payload(native_bin: Path) -> Path:
     shutil.copy2(RESOURCE_ROOT / "ui.json", target_opencode / "ui.json")
     shutil.copytree(RESOURCE_ROOT / "agents", target_opencode / "agents", ignore=PAYLOAD_IGNORE)
     shutil.copytree(RESOURCE_ROOT / "templates", target_opencode / "templates", ignore=PAYLOAD_IGNORE)
+    skills_dir = RESOURCE_ROOT / "skills"
+    if skills_dir.is_dir():
+        shutil.copytree(skills_dir, target_opencode / "skills", ignore=PAYLOAD_IGNORE)
     (target_opencode / "scripts").mkdir(parents=True, exist_ok=True)
     shutil.copy2(RESOURCE_ROOT / "scripts" / "edward.py", target_opencode / "scripts" / "edward.py")
     (target_opencode / "bin").mkdir(parents=True, exist_ok=True)
