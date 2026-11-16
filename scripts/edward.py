@@ -9,6 +9,7 @@ The service is intentionally dependency-free (Python standard library only):
   * collect   run fixed metric collectors and refresh dashboard
   * dashboard render dashboard from the latest metric snapshot
   * todo      manage cross-shift todos (add/list/update/start/done/delete)
+  * team      review, approve and sync the subagent team protocol
   * run-now   trigger a shift immediately
   * pause / resume / stop
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import html as html_lib
 import json
 import mimetypes
@@ -108,6 +110,7 @@ EXECUTION_DIR = EDWARD_ROOT / "execution"
 REPORTS_DIR = EXECUTION_DIR / "reports"
 REPLIES_DIR = EXECUTION_DIR / "report-reply"
 TODOS_FILE = EXECUTION_DIR / "todos.json"
+TEAM_FILE = EXECUTION_DIR / "team.yaml"
 DASHBOARD_DIR = EXECUTION_DIR / "dashboard"
 DASHBOARD_FILE = DASHBOARD_DIR / "dashboard.md"
 METRICS_FILE = DASHBOARD_DIR / "metrics.json"
@@ -129,8 +132,10 @@ STATE_LOCK_FILE = LOCK_DIR / "state.lock"
 RUN_LOCK_FILE = LOCK_DIR / "run.lock"
 DAEMON_LOCK_FILE = LOCK_DIR / "daemon.lock"
 TODO_LOCK_FILE = LOCK_DIR / "todos.lock"
+TEAM_LOCK_FILE = LOCK_DIR / "team.lock"
 EVENT_LOG = LOG_DIR / "edward.log"
 DOC_EDITS_FILE = STATE_DIR / "doc-edits.json"
+TEAM_SYNC_FILE = STATE_DIR / "team-sync.json"
 
 DEFAULT_INTERVAL_MINUTES = 360
 FAILURE_BACKOFF_MINUTES = 10
@@ -163,6 +168,27 @@ TODO_PRIORITY_BADGES = {"high": "rose", "medium": "amber", "low": ""}
 TODO_PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
 TODO_OPEN_STATUSES = {"pending", "in_progress"}
 
+TEAM_STATUSES = ("draft", "approved")
+TEAM_STRATEGIES = ("sequential", "parallel", "mixed")
+TEAM_ROLE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
+TEAM_AGENT_PREFIX = "edward-"
+TEAM_AGENT_MARKER = "<!-- edward-team-generated: true -->"
+TEAM_APPROVER_DENY = {"edward", "self", "agent", "assistant", "ai", "system"}
+TEAM_DEFAULT_PERMISSIONS = {
+    "edit": "allow",
+    "bash": "allow",
+    "webfetch": "allow",
+    "websearch": "allow",
+    "task": "deny",
+}
+TEAM_STATE_LABELS = {
+    "missing": "未初始化",
+    "invalid": "协议非法",
+    "draft": "待评审",
+    "changed": "待重新评审",
+    "approved": "已批准",
+}
+
 EXECUTION_DOCS = {
     "notebook": ("Notebook · 长期记忆", EXECUTION_DIR / "notebook.md"),
     "goal": ("目标 Goal", EXECUTION_DIR / "goal.md"),
@@ -181,6 +207,7 @@ ARTIFACT_MAP = {
     "execution/plan.md": EXECUTION_DIR / "plan.md",
     "execution/current_state.md": EXECUTION_DIR / "current_state.md",
     "execution/todos.json": TODOS_FILE,
+    "execution/team.yaml": TEAM_FILE,
     "execution/dashboard/dashboard.md": DASHBOARD_FILE,
     "execution/dashboard/metrics.json": METRICS_FILE,
     "execution/dashboard/collectors/web_metric.py": DASHBOARD_DIR / "collectors" / "web_metric.py",
@@ -818,6 +845,867 @@ def todo_prompt_summary(limit: int = 15) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Team protocol (YAML subset, stdlib only)
+# ---------------------------------------------------------------------------
+
+
+class SimpleYamlError(ValueError):
+    pass
+
+
+def _yaml_strip_comment(raw: str) -> str:
+    quote: str | None = None
+    output: list[str] = []
+    escaped = False
+    for index, char in enumerate(raw):
+        if quote:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            output.append(char)
+            continue
+        if char == "#" and (index == 0 or raw[index - 1].isspace()):
+            break
+        output.append(char)
+    return "".join(output).rstrip()
+
+
+def _yaml_split_key(content: str) -> tuple[str | None, str | None]:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(content):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == ":" and (index + 1 == len(content) or content[index + 1].isspace()):
+            return content[:index].strip(), content[index + 1 :].strip()
+    return None, None
+
+
+def _yaml_split_inline(content: str) -> list[str]:
+    values: list[str] = []
+    quote: str | None = None
+    escaped = False
+    current: list[str] = []
+    for char in content:
+        if quote:
+            current.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            continue
+        if char == ",":
+            values.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    values.append("".join(current).strip())
+    return [value for value in values if value]
+
+
+def _yaml_scalar(text: str) -> Any:
+    value = text.strip()
+    if value in {"", "~", "null", "Null", "NULL"}:
+        return None
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if value == "[]":
+        return []
+    if value == "{}":
+        return {}
+    if value.startswith("[") and value.endswith("]"):
+        return [_yaml_scalar(item) for item in _yaml_split_inline(value[1:-1])]
+    if value.startswith("{") and value.endswith("}"):
+        mapping: dict[str, Any] = {}
+        for item in _yaml_split_inline(value[1:-1]):
+            key, rest = _yaml_split_key(item)
+            if key is None:
+                raise SimpleYamlError(f"无法解析内联映射项: {item}")
+            mapping[key] = _yaml_scalar(rest or "")
+        return mapping
+    if value.startswith('"') and value.endswith('"'):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise SimpleYamlError(f"无法解析双引号字符串: {value}") from exc
+    if value.startswith("'") and value.endswith("'"):
+        return value[1:-1].replace("''", "'")
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+class SimpleYamlParser:
+    """Parse the small YAML subset used by team.yaml (maps, lists, quoted
+    scalars, inline maps/lists and block literals). Anchors, multi-document
+    streams and other advanced YAML features are not supported."""
+
+    def __init__(self, text: str) -> None:
+        self.lines = text.replace("\r\n", "\n").split("\n")
+        self.index = 0
+
+    def _error(self, message: str) -> None:
+        raise SimpleYamlError(f"第 {self.index + 1} 行: {message}")
+
+    def _indent(self, line: str) -> int:
+        leading = line[: len(line) - len(line.lstrip(" "))]
+        if "\t" in leading:
+            self._error("缩进不能使用 Tab")
+        return len(leading)
+
+    def _skip(self) -> None:
+        while self.index < len(self.lines):
+            raw = self.lines[self.index]
+            if not raw.strip() or raw.lstrip().startswith("#"):
+                self.index += 1
+                continue
+            self._indent(raw)
+            break
+
+    def parse(self) -> Any:
+        self._skip()
+        if self.index >= len(self.lines):
+            return {}
+        value = self._parse_block(self._indent(self.lines[self.index]))
+        self._skip()
+        if self.index < len(self.lines):
+            self._error("存在无法归属的内容")
+        return value
+
+    def _parse_block(self, indent: int) -> Any:
+        self._skip()
+        if self.index >= len(self.lines):
+            return None
+        raw = self.lines[self.index]
+        current = self._indent(raw)
+        if current < indent:
+            return None
+        if raw.strip().startswith("-"):
+            return self._parse_sequence(current)
+        return self._parse_mapping(current)
+
+    def _parse_mapping(self, indent: int) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        while True:
+            self._skip()
+            if self.index >= len(self.lines):
+                break
+            raw = self.lines[self.index]
+            current = self._indent(raw)
+            if current < indent:
+                break
+            if current > indent:
+                self._error("映射字段缩进不一致")
+            content = _yaml_strip_comment(raw).strip()
+            if not content:
+                self.index += 1
+                continue
+            if content.startswith("-"):
+                break
+            key, rest = _yaml_split_key(content)
+            if key is None:
+                self._error("映射字段缺少冒号")
+            if key in result:
+                self._error(f"重复的映射字段: {key}")
+            self.index += 1
+            if rest in {"|", "|-", "|+", ">", ">-", ">+"}:
+                result[key] = self._parse_block_scalar(
+                    indent, folded=rest.startswith(">"), strip=rest.endswith("-")
+                )
+            elif rest:
+                result[key] = _yaml_scalar(rest)
+            else:
+                self._skip()
+                if self.index < len(self.lines) and self._indent(self.lines[self.index]) > indent:
+                    result[key] = self._parse_block(self._indent(self.lines[self.index]))
+                else:
+                    result[key] = None
+        return result
+
+    def _parse_sequence(self, indent: int) -> list[Any]:
+        result: list[Any] = []
+        item_indent = indent + 2
+        while True:
+            self._skip()
+            if self.index >= len(self.lines):
+                break
+            raw = self.lines[self.index]
+            current = self._indent(raw)
+            if current < indent:
+                break
+            if current > indent:
+                self._error("列表项缩进不一致")
+            content = _yaml_strip_comment(raw).strip()
+            if not content:
+                self.index += 1
+                continue
+            if not content.startswith("-"):
+                break
+            after = content[1:]
+            if after and not after.startswith(" "):
+                self._error("列表项 '-' 后需要空格")
+            item_text = after.strip()
+            self.index += 1
+            if not item_text:
+                self._skip()
+                if self.index < len(self.lines) and self._indent(self.lines[self.index]) > indent:
+                    result.append(self._parse_block(self._indent(self.lines[self.index])))
+                else:
+                    result.append(None)
+                continue
+
+            if item_text in {"|", "|-", "|+", ">", ">-", ">+"}:
+                result.append(
+                    self._parse_block_scalar(
+                        indent, folded=item_text.startswith(">"), strip=item_text.endswith("-")
+                    )
+                )
+                continue
+
+            key, rest = _yaml_split_key(item_text)
+            if key is None:
+                result.append(_yaml_scalar(item_text))
+                self._skip()
+                if self.index < len(self.lines) and self._indent(self.lines[self.index]) > indent:
+                    self._error("列表标量后不能追加更深缩进的内容")
+                continue
+
+            item: dict[str, Any] = {}
+            if rest in {"|", "|-", "|+", ">", ">-", ">+"}:
+                item[key] = self._parse_block_scalar(
+                    item_indent, folded=rest.startswith(">"), strip=rest.endswith("-")
+                )
+            elif rest:
+                item[key] = _yaml_scalar(rest)
+            else:
+                self._skip()
+                if self.index < len(self.lines) and self._indent(self.lines[self.index]) > item_indent:
+                    item[key] = self._parse_block(self._indent(self.lines[self.index]))
+                else:
+                    item[key] = None
+            self._skip()
+            if self.index < len(self.lines) and self._indent(self.lines[self.index]) == item_indent:
+                item.update(self._parse_mapping(item_indent))
+            result.append(item)
+        return result
+
+    def _parse_block_scalar(self, parent_indent: int, folded: bool, strip: bool) -> str:
+        collected: list[str] = []
+        base_indent: int | None = None
+        while self.index < len(self.lines):
+            raw = self.lines[self.index]
+            if not raw.strip():
+                collected.append("")
+                self.index += 1
+                continue
+            current = self._indent(raw)
+            if current <= parent_indent:
+                break
+            if base_indent is None:
+                base_indent = current
+            if current < base_indent:
+                break
+            collected.append(raw[base_indent:])
+            self.index += 1
+        while collected and not collected[-1].strip():
+            collected.pop()
+        if folded:
+            text = " ".join(part.strip() for part in collected if part.strip())
+        else:
+            text = "\n".join(collected)
+        return text.rstrip("\n") if strip else text
+
+
+def parse_simple_yaml(text: str) -> Any:
+    return SimpleYamlParser(text).parse()
+
+
+def _yaml_dump_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (list, dict)) and not value:
+        return "[]" if isinstance(value, list) else "{}"
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _yaml_emit(value: Any, indent: int = 0) -> list[str]:
+    pad = " " * indent
+    lines: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, str) and "\n" in item:
+                lines.append(f"{pad}{key}: |")
+                for line in item.rstrip("\n").split("\n"):
+                    lines.append((" " * (indent + 2) + line) if line else "")
+            elif isinstance(item, (dict, list)) and item:
+                lines.append(f"{pad}{key}:")
+                lines.extend(_yaml_emit(item, indent + 2))
+            else:
+                lines.append(f"{pad}{key}: {_yaml_dump_scalar(item)}")
+        return lines
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str) and "\n" in item:
+                lines.append(f"{pad}- |")
+                for line in item.rstrip("\n").split("\n"):
+                    lines.append((" " * (indent + 2) + line) if line else "")
+            elif isinstance(item, (dict, list)) and item:
+                lines.append(f"{pad}-")
+                lines.extend(_yaml_emit(item, indent + 2))
+            else:
+                lines.append(f"{pad}- {_yaml_dump_scalar(item)}")
+        return lines
+    return [f"{pad}{_yaml_dump_scalar(value)}"]
+
+
+def dump_simple_yaml(value: Any) -> str:
+    return "\n".join(_yaml_emit(value)) + "\n"
+
+
+def default_team() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "status": "draft",
+        "name": "",
+        "objective": "",
+        "approval": {
+            "approved_by": None,
+            "approved_at": None,
+            "reference": None,
+            "content_hash": None,
+        },
+        "orchestration": {"strategy": "sequential", "rules": []},
+        "roles": [],
+        "workflow": [],
+    }
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [_clean_text(item) for item in value if _clean_text(item)]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def normalize_team(raw: Any) -> dict[str, Any]:
+    team = default_team()
+    if not isinstance(raw, dict):
+        return team
+    try:
+        team["version"] = int(raw.get("version", 1))
+    except (TypeError, ValueError):
+        team["version"] = 1
+    status = _clean_text(raw.get("status"))
+    team["status"] = status if status in TEAM_STATUSES else "draft"
+    team["name"] = _clean_text(raw.get("name"))
+    team["objective"] = _clean_text(raw.get("objective"))
+
+    approval = raw.get("approval")
+    if isinstance(approval, dict):
+        team["approval"] = {
+            "approved_by": _clean_text(approval.get("approved_by")) or None,
+            "approved_at": _clean_text(approval.get("approved_at")) or None,
+            "reference": _clean_text(approval.get("reference")) or None,
+            "content_hash": _clean_text(approval.get("content_hash")) or None,
+        }
+
+    orchestration = raw.get("orchestration")
+    if isinstance(orchestration, dict):
+        strategy = _clean_text(orchestration.get("strategy")) or "sequential"
+        team["orchestration"] = {
+            "strategy": strategy if strategy in TEAM_STRATEGIES else "sequential",
+            "rules": _string_list(orchestration.get("rules")),
+        }
+
+    roles = raw.get("roles")
+    if isinstance(roles, list):
+        normalized_roles: list[dict[str, Any]] = []
+        for item in roles:
+            if not isinstance(item, dict):
+                continue
+            permissions = dict(TEAM_DEFAULT_PERMISSIONS)
+            raw_permissions = item.get("permissions")
+            if isinstance(raw_permissions, dict):
+                for key, value in raw_permissions.items():
+                    action = _clean_text(value)
+                    if action in {"allow", "ask", "deny"}:
+                        permissions[str(key)] = action
+            raw_can_delegate = item.get("can_delegate", False)
+            if isinstance(raw_can_delegate, bool):
+                can_delegate = raw_can_delegate
+            else:
+                can_delegate = str(raw_can_delegate).lower() in {"true", "yes", "1"}
+            permissions["task"] = "allow" if can_delegate else "deny"
+            try:
+                temperature = float(item.get("temperature", 0.2))
+            except (TypeError, ValueError):
+                temperature = 0.2
+            normalized_roles.append(
+                {
+                    "id": _clean_text(item.get("id")),
+                    "title": _clean_text(item.get("title")),
+                    "description": _clean_text(item.get("description")),
+                    "responsibilities": _string_list(item.get("responsibilities")),
+                    "deliverables": _string_list(item.get("deliverables")),
+                    "prompt": _clean_text(item.get("prompt")),
+                    "can_delegate": can_delegate,
+                    "model": _clean_text(item.get("model")),
+                    "temperature": temperature,
+                    "permissions": permissions,
+                }
+            )
+        team["roles"] = normalized_roles
+
+    workflow = raw.get("workflow")
+    if isinstance(workflow, list):
+        normalized_workflow: list[dict[str, Any]] = []
+        for item in workflow:
+            if not isinstance(item, dict):
+                continue
+            normalized_workflow.append(
+                {
+                    "phase": _clean_text(item.get("phase")),
+                    "description": _clean_text(item.get("description")),
+                    "roles": _string_list(item.get("roles")),
+                }
+            )
+        team["workflow"] = normalized_workflow
+    return team
+
+
+def load_team() -> dict[str, Any]:
+    if not TEAM_FILE.exists():
+        team = default_team()
+        team["_exists"] = False
+        return team
+    parse_error = None
+    try:
+        raw = parse_simple_yaml(TEAM_FILE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, SimpleYamlError) as exc:
+        raw = None
+        parse_error = str(exc)
+    team = normalize_team(raw)
+    team["_exists"] = True
+    if parse_error:
+        team["_parse_error"] = parse_error
+    return team
+
+
+def save_team(team: dict[str, Any]) -> None:
+    clean = {key: value for key, value in team.items() if not key.startswith("_")}
+    write_text_atomic(TEAM_FILE, dump_simple_yaml(clean))
+
+
+def team_design_hash(team: dict[str, Any]) -> str:
+    design = {
+        "name": team.get("name", ""),
+        "objective": team.get("objective", ""),
+        "orchestration": team.get("orchestration", {}),
+        "roles": team.get("roles", []),
+        "workflow": team.get("workflow", []),
+    }
+    payload = json.dumps(design, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def team_agent_name(role: dict[str, Any]) -> str:
+    return f"{TEAM_AGENT_PREFIX}{role.get('id', '')}"
+
+
+def team_validation_errors(team: dict[str, Any], check_approval_hash: bool = True) -> list[str]:
+    errors: list[str] = []
+    if team.get("_parse_error"):
+        errors.append(f"team.yaml 解析失败：{team['_parse_error']}")
+    if not team.get("_exists", True):
+        errors.append("team.yaml 不存在，请先运行 `.opencode/bin/edward team init`")
+        return errors
+    if not team.get("name"):
+        errors.append("缺少团队名称 name")
+    if not team.get("objective"):
+        errors.append("缺少团队目标 objective")
+    orchestration_rules = (team.get("orchestration") or {}).get("rules") or []
+    if not orchestration_rules:
+        errors.append("至少需要一条编排规则 orchestration.rules")
+    roles = team.get("roles") or []
+    if not roles:
+        errors.append("至少需要定义一个角色 roles")
+    seen: set[str] = set()
+    for role in roles:
+        role_id = str(role.get("id") or "")
+        if not TEAM_ROLE_ID_PATTERN.fullmatch(role_id):
+            errors.append(
+                f"角色 id 非法（需小写字母开头、总长 2-41、仅含小写字母/数字/连字符）: {role_id!r}"
+            )
+        if role_id == "edward":
+            errors.append("角色 id 不能是 edward（主 agent 名称）")
+        if role_id in seen:
+            errors.append(f"角色 id 重复: {role_id}")
+        seen.add(role_id)
+        if not role.get("title"):
+            errors.append(f"角色 {role_id or '?'} 缺少 title")
+        if not role.get("description"):
+            errors.append(f"角色 {role_id or '?'} 缺少 description")
+        if not role.get("responsibilities"):
+            errors.append(f"角色 {role_id or '?'} 缺少 responsibilities")
+        if not role.get("deliverables"):
+            errors.append(f"角色 {role_id or '?'} 缺少 deliverables")
+        model = str(role.get("model") or "")
+        if model and "/" not in model:
+            errors.append(f"角色 {role_id or '?'} 的 model 需要 provider/model 格式")
+    workflow = team.get("workflow") or []
+    if not workflow:
+        errors.append("至少需要一个工作流阶段 workflow")
+    for phase in workflow:
+        phase_name = str(phase.get("phase") or "")
+        if not phase_name:
+            errors.append("workflow 中存在缺少 phase 的条目")
+        phase_roles = phase.get("roles") or []
+        if not phase_roles:
+            errors.append(f"工作流阶段 {phase_name or '?'} 没有指定 roles")
+        for role_id in phase_roles:
+            if role_id not in seen:
+                errors.append(f"工作流阶段 {phase_name or '?'} 引用了未定义角色: {role_id}")
+    if team.get("status") == "approved":
+        approval = team.get("approval") or {}
+        if not approval.get("approved_by"):
+            errors.append("已批准团队缺少 approval.approved_by")
+        if not approval.get("approved_at"):
+            errors.append("已批准团队缺少 approval.approved_at")
+        if check_approval_hash and approval.get("content_hash") != team_design_hash(team):
+            errors.append("团队设计在批准后已变更，需要人类重新评审并通过 `edward team approve`")
+    return errors
+
+
+def team_effective_status(team: dict[str, Any]) -> str:
+    if not team.get("_exists", True):
+        return "missing"
+    if team.get("_parse_error"):
+        return "invalid"
+    if team.get("status") == "approved":
+        approval = team.get("approval") or {}
+        if approval.get("content_hash") != team_design_hash(team):
+            return "changed"
+        if team_validation_errors(team, check_approval_hash=False):
+            return "invalid"
+        return "approved"
+    return "draft"
+
+
+def team_sync_state(team: dict[str, Any]) -> dict[str, Any]:
+    metadata = load_json(TEAM_SYNC_FILE, {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    agents_dir = OPENCODE_DIR / "agents"
+    generated = metadata.get("agents") if isinstance(metadata.get("agents"), list) else []
+    files_ok = True
+    for entry in generated:
+        if not isinstance(entry, dict):
+            files_ok = False
+            continue
+        agent = str(entry.get("agent") or "")
+        path = Path(str(entry.get("path") or ""))
+        if not agent.startswith(TEAM_AGENT_PREFIX) or path.name != f"{agent}.md" or not path.is_file():
+            files_ok = False
+            break
+        expected = str(entry.get("content_hash") or "")
+        try:
+            actual = hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+        except (OSError, UnicodeDecodeError):
+            files_ok = False
+            break
+        if not expected or actual != expected:
+            files_ok = False
+            break
+    synced = bool(
+        team_effective_status(team) == "approved"
+        and metadata.get("content_hash") == team_design_hash(team)
+        and generated
+        and files_ok
+    )
+    return {
+        "synced": synced,
+        "synced_at": metadata.get("synced_at"),
+        "content_hash": metadata.get("content_hash"),
+        "agents": generated if isinstance(generated, list) else [],
+        "agents_dir": str(agents_dir),
+    }
+
+
+def team_roles_payload(team: dict[str, Any]) -> list[dict[str, Any]]:
+    sync = team_sync_state(team)
+    generated = {
+        str(entry.get("id")): entry
+        for entry in sync.get("agents", [])
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    result: list[dict[str, Any]] = []
+    for role in team.get("roles", []):
+        role_id = str(role.get("id") or "")
+        agent = team_agent_name(role)
+        entry = generated.get(role_id) or {}
+        result.append(
+            {
+                **role,
+                "agent": agent,
+                "agent_file": entry.get("path"),
+                "agent_file_exists": bool(entry.get("path") and Path(str(entry["path"])).is_file()),
+            }
+        )
+    return result
+
+
+def team_summary(team: dict[str, Any]) -> dict[str, Any]:
+    sync = team_sync_state(team)
+    effective_status = team_effective_status(team)
+    errors = team_validation_errors(team)
+    if effective_status == "approved" and not sync.get("synced"):
+        errors.append("生成 subagent 缺失、被修改或尚未同步，请重新运行 `edward team sync`")
+    return {
+        "exists": bool(team.get("_exists", True)),
+        "name": team.get("name") or "",
+        "objective": team.get("objective") or "",
+        "status": team.get("status") or "draft",
+        "effective_status": effective_status,
+        "strategy": (team.get("orchestration") or {}).get("strategy") or "sequential",
+        "role_count": len(team.get("roles") or []),
+        "phase_count": len(team.get("workflow") or []),
+        "approved_by": (team.get("approval") or {}).get("approved_by"),
+        "approved_at": (team.get("approval") or {}).get("approved_at"),
+        "approval_reference": (team.get("approval") or {}).get("reference"),
+        "synced": bool(sync.get("synced")),
+        "synced_at": sync.get("synced_at"),
+        "errors": errors,
+        "parse_error": team.get("_parse_error"),
+    }
+
+
+def team_payload() -> dict[str, Any]:
+    team = load_team()
+    return {
+        "generated_at": iso(now()),
+        "summary": team_summary(team),
+        "protocol": {key: value for key, value in team.items() if not key.startswith("_")},
+        "roles": team_roles_payload(team),
+        "sync": team_sync_state(team),
+    }
+
+
+def team_prompt_summary() -> str:
+    team = load_team()
+    summary = team_summary(team)
+    status = summary["effective_status"]
+    if status == "missing":
+        return (
+            "【团队协议】team.yaml 不存在。项目初始化必须先设计团队编制，"
+            "运行 `.opencode/bin/edward team init` 生成草案，完成角色/分工/工作流后再交人类评审。\n"
+        )
+    if status in {"invalid", "changed", "draft"}:
+        labels = {
+            "invalid": "解析失败或结构非法",
+            "changed": "批准后设计已变更，需重新评审",
+            "draft": "草案，尚未获得人类批准",
+        }
+        detail = "；".join(summary["errors"][:6]) if summary["errors"] else "尚未完成评审"
+        return (
+            f"【团队协议】当前状态：{labels.get(status, status)}。"
+            "启动闸门未通过：禁止开展实质工作、禁止修改项目代码，也不要用通用 subagent 绕过。"
+            f"先完善 `edward/execution/team.yaml` 并交人类评审。问题：{detail}\n"
+        )
+    if not summary["synced"]:
+        return (
+            "【团队协议】已获人类批准，但尚未同步到 opencode 或同步已过期。"
+            "先运行 `.opencode/bin/edward team sync`，然后立即 "
+            "`.opencode/bin/edward schedule --in 1m` 并收工；下一班次重新加载团队后才能开工。"
+            "禁止在当前班次绕过团队直接执行。\n"
+        )
+
+    lines = [
+        f"【团队协议】已批准并同步。团队：{summary['name']} · 策略 {summary['strategy']} · "
+        f"角色 {summary['role_count']} · 同步于 {summary['synced_at']}。",
+    ]
+    for role in team.get("roles", []):
+        responsibilities = "；".join(role.get("responsibilities") or [])
+        lines.append(
+            f"- {role.get('id')} | {role.get('title')} | subagent={team_agent_name(role)} | "
+            f"责任：{responsibilities}"
+        )
+    for phase in team.get("workflow", []):
+        lines.append(
+            f"- 工作流 {phase.get('phase')}: {', '.join(phase.get('roles') or [])} — "
+            f"{phase.get('description') or ''}"
+        )
+    rules = (team.get("orchestration") or {}).get("rules") or []
+    if rules:
+        lines.append("- 编排规则：" + "；".join(rules))
+    lines.append(
+        "调用纪律：一旦进入 WORK，每个工作项必须通过 task 工具调用协议中的 subagent"
+        "（`subagent_type=edward-<role-id>`），派发时写清目标、输入、完成标准、验证方式；"
+        "Edward 负责编排与验收，禁止绕过团队自己包办。只有初始化设计/评审阶段可以暂不派发。"
+    )
+    return "\n".join(lines) + "\n"
+
+
+def render_team_agent(role: dict[str, Any], team: dict[str, Any]) -> str:
+    description = f"Edward 团队角色 · {role.get('title')} — {role.get('description')}"
+    description = " ".join(str(description).split())
+    permission_keys = ["edit", "bash", "webfetch", "websearch", "task"]
+    permissions = role.get("permissions") or TEAM_DEFAULT_PERMISSIONS
+    permission_lines = []
+    for key in permission_keys:
+        action = permissions.get(key)
+        if action:
+            permission_lines.append(f'  {key}: "{action}"')
+    frontmatter = [
+        "---",
+        f"description: {json.dumps(description, ensure_ascii=False)}",
+        "mode: subagent",
+        f"temperature: {float(role.get('temperature', 0.2))}",
+    ]
+    model = role.get("model")
+    if model:
+        frontmatter.append(f"model: {json.dumps(str(model), ensure_ascii=False)}")
+    frontmatter.append("permission:")
+    frontmatter.extend(permission_lines)
+    frontmatter.append("---")
+
+    responsibilities = role.get("responsibilities") or []
+    deliverables = role.get("deliverables") or []
+    body = [
+        "",
+        TEAM_AGENT_MARKER,
+        f"你是 Edward 团队中的「{role.get('title')}」（role id: `{role.get('id')}`）。",
+        "",
+        f"团队：{team.get('name') or '(未命名)'}",
+        f"团队目标：{team.get('objective') or '(未填写)'}",
+        "",
+        "## 角色说明",
+        "",
+        str(role.get("description") or ""),
+        "",
+        "## 你的责任",
+        "",
+    ]
+    body.extend(f"- {item}" for item in responsibilities)
+    if deliverables:
+        body.extend(["", "## 交付物", ""])
+        body.extend(f"- {item}" for item in deliverables)
+    body.extend(
+        [
+            "",
+            "## 协作纪律",
+            "",
+            "- 只处理角色职责范围内的任务；越界、依赖缺失或验收标准不清时，明确回报给 Edward。",
+            "- 先读相关文件与团队协议 `edward/execution/team.yaml`，再动手。",
+            "- 不修改 `edward/codex/`、`edward/execution/report-reply/` 和人类维护的 references。",
+            "- 完成后必须回报：结论、改动文件、验证命令与结果、风险与待确认事项。",
+            "- 本文件由 `edward team sync` 自动生成，禁止手改；团队协议变更后由 Edward 重新同步。",
+        ]
+    )
+    if role.get("can_delegate"):
+        body.append("- 协议允许你在必要时继续用 task 委派，但必须说明理由并汇总下级结果。")
+    else:
+        body.append("- 不要继续调用 task 委派；需要更多人手时回报 Edward 统一编排。")
+    if role.get("prompt"):
+        body.extend(["", "## 角色操作指引", "", str(role["prompt"])])
+    return "\n".join(frontmatter + body).rstrip() + "\n"
+
+
+def sync_team_agents(team: dict[str, Any]) -> dict[str, Any]:
+    errors = team_validation_errors(team)
+    if errors:
+        raise ValueError("团队协议未通过校验：" + "；".join(errors))
+    if team.get("status") != "approved":
+        raise ValueError("团队协议尚未获得人类批准，不能同步 subagent")
+    agents_dir = OPENCODE_DIR / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+
+    generated: list[dict[str, Any]] = []
+    keep_paths: set[Path] = set()
+    for role in team.get("roles", []):
+        agent = team_agent_name(role)
+        path = agents_dir / f"{agent}.md"
+        content = render_team_agent(role, team)
+        write_text_atomic(path, content)
+        keep_paths.add(path.resolve())
+        generated.append(
+            {
+                "id": role.get("id"),
+                "title": role.get("title"),
+                "agent": agent,
+                "path": str(path),
+                "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            }
+        )
+
+    allowed_root = agents_dir.resolve()
+    candidates = list(agents_dir.glob(f"{TEAM_AGENT_PREFIX}*.md"))
+    previous = load_json(TEAM_SYNC_FILE, {})
+    old_agents = previous.get("agents") if isinstance(previous, dict) else []
+    if isinstance(old_agents, list):
+        for entry in old_agents:
+            if isinstance(entry, dict) and entry.get("path"):
+                candidates.append(Path(str(entry["path"])))
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(allowed_root)
+        except (OSError, ValueError):
+            continue
+        if resolved in keep_paths or resolved.name == "edward.md":
+            continue
+        if not resolved.name.startswith(TEAM_AGENT_PREFIX) or not resolved.name.endswith(".md"):
+            continue
+        if resolved.is_file():
+            resolved.unlink()
+
+    metadata = {
+        "version": 1,
+        "synced_at": iso(now()),
+        "content_hash": team_design_hash(team),
+        "team_name": team.get("name"),
+        "agents": generated,
+    }
+    write_json_atomic(TEAM_SYNC_FILE, metadata)
+    log_event("team_sync", team=team.get("name"), agents=[entry["agent"] for entry in generated])
+    return metadata
+
+
+# ---------------------------------------------------------------------------
 # Workspace init
 # ---------------------------------------------------------------------------
 
@@ -1315,19 +2203,23 @@ def build_prompt(
         intro = "上班。本次是定时唤醒。\n"
 
     intro += (
-        "\n请读取 edward/codex/index.md、goal.md、plan.md、current_state.md、"
-        "edward/execution/todos.json、notebook.md、相关 knowledge 和最近一份 report，"
-        "判断当前阶段并推进本班次工作。\n"
+        "\n请读取 edward/codex/index.md、goal.md、plan.md、"
+        "edward/execution/team.yaml、current_state.md、edward/execution/todos.json、"
+        "notebook.md、相关 knowledge 和最近一份 report，判断当前阶段并推进本班次工作。\n"
         "\n"
+        + team_prompt_summary()
+        + "\n"
         + todo_prompt_summary()
         + "\n收工前必须完成：\n"
         "1. 更新 edward/execution/current_state.md（自然语言，不要写调度解析格式）。\n"
         "2. 更新 edward/execution/todos.json：完成项 done、进行项 in_progress、新增需求登记，"
         "状态变更统一通过 CLI 写入，避免手改 JSON 造成损坏。\n"
         "3. 写 edward/execution/reports/<EDWARD_RUN_ID>.md，包含进度、完成情况、阻塞项、待决策项。\n"
-        "4. 用 python3 .opencode/scripts/edward.py schedule --in <时长> 或 --at <时间> 声明下次唤醒；"
+        "4. 核对团队协议：若本次批准或修改了 team.yaml，运行 `edward team approve` / `edward team sync`，"
+        "并安排下一班次重新加载团队；未通过启动闸门时不得开展实质工作。\n"
+        "5. 用 python3 .opencode/scripts/edward.py schedule --in <时长> 或 --at <时间> 声明下次唤醒；"
         "若待办最早截止早于默认唤醒，优先按待办截止时间安排。\n"
-        "5. 如果目标达成，使用独立 final-report 模板写 reports/final-<EDWARD_RUN_ID>.md，并等待人类在 report-reply 验收。\n"
+        "6. 如果目标达成，使用独立 final-report 模板写 reports/final-<EDWARD_RUN_ID>.md，并等待人类在 report-reply 验收。\n"
     )
 
     if reason == "interval" and scheduler_data.get("schedule_source") == "default":
@@ -1385,6 +2277,8 @@ def run_agent(
             "EDWARD_PROJECT_ROOT": str(PROJECT_ROOT),
             "EDWARD_SCHEDULER": str(SCHEDULER_FILE),
             "EDWARD_EXECUTION_DIR": str(EXECUTION_DIR),
+            "EDWARD_TEAM_FILE": str(TEAM_FILE),
+            "EDWARD_TEAM_STATUS": team_effective_status(load_team()),
         }
     )
 
@@ -1796,6 +2690,166 @@ def cmd_todo_show(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Team commands
+# ---------------------------------------------------------------------------
+
+
+def print_team_summary(team: dict[str, Any]) -> None:
+    summary = team_summary(team)
+    label = TEAM_STATE_LABELS.get(summary["effective_status"], summary["effective_status"])
+    print(f"团队: {summary['name'] or '(未命名)'}  状态: {label}")
+    print(
+        f"  角色: {summary['role_count']}  工序: {summary['phase_count']}  "
+        f"策略: {summary['strategy']}  同步: {'是' if summary['synced'] else '否'}"
+    )
+    if summary["approved_by"]:
+        print(f"  批准: {summary['approved_by']} @ {summary['approved_at'] or '—'}")
+    if summary["approval_reference"]:
+        print(f"  评审依据: {summary['approval_reference']}")
+    if summary["synced_at"]:
+        print(f"  同步时间: {summary['synced_at']}")
+    if summary["objective"]:
+        print(f"  目标: {summary['objective']}")
+    if summary["errors"]:
+        print("  问题:")
+        for error in summary["errors"]:
+            print(f"    - {error}")
+    roles = team.get("roles") or []
+    if roles:
+        print("  排兵布阵:")
+        for role in roles:
+            print(f"    - {role.get('id')} · {role.get('title')} · subagent={team_agent_name(role)}")
+    workflow = team.get("workflow") or []
+    if workflow:
+        print("  工作流:")
+        for phase in workflow:
+            print(
+                f"    - {phase.get('phase')}: {', '.join(phase.get('roles') or [])}"
+                f" — {phase.get('description') or ''}"
+            )
+    rules = (team.get("orchestration") or {}).get("rules") or []
+    if rules:
+        print("  编排规则:")
+        for rule in rules:
+            print(f"    - {rule}")
+
+
+def cmd_team_init(args: argparse.Namespace) -> int:
+    if TEAM_FILE.exists():
+        print(f"团队协议已存在，跳过: {TEAM_FILE}")
+        return 0
+    source = TEMPLATES_DIR / "execution" / "team.yaml"
+    if not source.exists():
+        print(f"[edward] 缺少团队协议模板: {source}", file=sys.stderr)
+        return 1
+    TEAM_FILE.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, TEAM_FILE)
+    print(f"已创建团队协议草案: {TEAM_FILE}")
+    print("请与 goal / plan / KPI / 工作方案一起交人类评审，批准后运行 team approve / team sync。")
+    log_event("team_init", path=str(TEAM_FILE))
+    return 0
+
+
+def cmd_team_show(args: argparse.Namespace) -> int:
+    team = load_team()
+    if args.json:
+        print(json.dumps(team_payload(), ensure_ascii=False, indent=2))
+    else:
+        print_team_summary(team)
+    return 0
+
+
+def cmd_team_validate(args: argparse.Namespace) -> int:
+    team = load_team()
+    errors = team_validation_errors(team)
+    payload = {"valid": not errors, "errors": errors, "summary": team_summary(team)}
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif errors:
+        print("团队协议未通过校验：", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+    else:
+        print("团队协议校验通过。")
+    return 0 if not errors else 1
+
+
+def cmd_team_approve(args: argparse.Namespace) -> int:
+    approved_by = _clean_text(args.by)
+    reference = _clean_text(args.ref)
+    if not approved_by:
+        print("[edward] --by 不能为空；必须记录人类批准人。", file=sys.stderr)
+        return 2
+    if approved_by.lower() in TEAM_APPROVER_DENY:
+        print("[edward] 批准人不能是 Edward/agent 自身，必须由人类领导批准。", file=sys.stderr)
+        return 2
+    if not reference:
+        print("[edward] --ref 不能为空；请填写评审依据（report-reply、会议结论或人工确认记录）。", file=sys.stderr)
+        return 2
+
+    with file_lock(TEAM_LOCK_FILE):
+        team = load_team()
+        errors = team_validation_errors(team, check_approval_hash=False)
+        if errors:
+            print("[edward] 团队协议未通过校验，不能批准：", file=sys.stderr)
+            for error in errors:
+                print(f"  - {error}", file=sys.stderr)
+            return 1
+        team["status"] = "approved"
+        team["approval"] = {
+            "approved_by": approved_by,
+            "approved_at": iso(now()),
+            "reference": reference,
+            "content_hash": team_design_hash(team),
+        }
+        post_errors = team_validation_errors(team)
+        if post_errors:
+            print("[edward] 批准后复验失败，未写入：", file=sys.stderr)
+            for error in post_errors:
+                print(f"  - {error}", file=sys.stderr)
+            return 1
+        save_team(team)
+    print(f"团队协议已批准：{team.get('name')}")
+    print(f"批准人: {approved_by}")
+    print(f"评审依据: {reference}")
+    print("下一步: 运行 `.opencode/bin/edward team sync` 生成 subagent；")
+    print("如果在本班次同步，请随后 schedule --in 1m 并收工，让下一班次重新加载团队。")
+    log_event("team_approve", team=team.get("name"), approved_by=approved_by, reference=reference)
+    return 0
+
+
+def cmd_team_sync(args: argparse.Namespace) -> int:
+    with file_lock(TEAM_LOCK_FILE):
+        team = load_team()
+        try:
+            metadata = sync_team_agents(team)
+        except ValueError as exc:
+            print(f"[edward] {exc}", file=sys.stderr)
+            return 1
+    if args.json:
+        print(json.dumps({**metadata, "summary": team_summary(load_team())}, ensure_ascii=False, indent=2))
+    else:
+        print(f"团队 subagent 已同步: {len(metadata['agents'])} 个")
+        for entry in metadata["agents"]:
+            print(f"  - {entry['agent']}: {entry['path']}")
+        print("注意: 当前班次已加载的 agent 配置不会热更新。")
+        print("如在本班次同步，请运行 `.opencode/bin/edward schedule --in 1m` 并收工，下一班次再开工。")
+    return 0
+
+
+def cmd_team_status(args: argparse.Namespace) -> int:
+    team = load_team()
+    summary = team_summary(team)
+    if args.json:
+        print(json.dumps({"summary": summary, "sync": team_sync_state(team)}, ensure_ascii=False, indent=2))
+    else:
+        print_team_summary(team)
+        print(f"  生效状态: {TEAM_STATE_LABELS.get(summary['effective_status'], summary['effective_status'])}")
+        print(f"  同步路径: {OPENCODE_DIR / 'agents'}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -1910,6 +2964,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         ui_payload = {"enabled": False, "error": str(exc)}
     todo_data = load_todos()
     todo_stats = todo_summary(todo_data)
+    team_stats = team_summary(load_team())
 
     payload = {
         "project_root": str(PROJECT_ROOT),
@@ -1921,6 +2976,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "report_count": len(list(REPORTS_DIR.glob("*.md"))),
         "reply_count": len(current_replies),
         "todos": todo_stats,
+        "team": team_stats,
         "dashboard": {
             "path": str(DASHBOARD_FILE),
             "updated_at": dashboard_updated,
@@ -1958,6 +3014,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         f"open={todo_stats['open']} overdue={todo_stats['overdue']} "
         f"today={todo_stats['today']} done={todo_stats['completed']} "
         f"next={todo_stats.get('next_due_at') or '未设置'}"
+    )
+    print(
+        "  team:      "
+        f"status={TEAM_STATE_LABELS.get(team_stats['effective_status'], team_stats['effective_status'])} "
+        f"roles={team_stats['role_count']} synced={'yes' if team_stats['synced'] else 'no'}"
     )
     print(
         "  dashboard: "
@@ -2974,11 +4035,172 @@ def ui_page_todos(config: dict[str, Any]) -> str:
     return ui_layout(config, "待办清单", "/todos", content)
 
 
+def ui_team_badge(summary: dict[str, Any]) -> tuple[str, str]:
+    status = summary.get("effective_status")
+    if status == "approved":
+        if summary.get("synced"):
+            return "已批准 · 已同步", "green"
+        return "已批准 · 待同步", "amber"
+    if status == "draft":
+        return "待评审", "blue"
+    if status == "changed":
+        return "待重新评审", "rose"
+    if status == "invalid":
+        return "协议非法", "rose"
+    return "未初始化", "rose"
+
+
+def ui_team_summary_card(config: dict[str, Any]) -> str:
+    team = load_team()
+    summary = team_summary(team)
+    label, badge = ui_team_badge(summary)
+    role_chips = "".join(
+        f'<span class="badge blue">{html_lib.escape(str(role.get("title") or role.get("id")))}</span> '
+        for role in team.get("roles", [])
+    )
+    body = (
+        f'<div class="todo-tags">{role_chips}</div>'
+        if role_chips
+        else '<div class="empty">团队编制尚未设计。</div>'
+    )
+    return f"""
+    <div class="card">
+      <h3>团队编制
+        <span class="badge {badge}">{html_lib.escape(label)}</span>
+        <span class="muted small">角色 {summary['role_count']} · 工序 {summary['phase_count']} · 策略 {html_lib.escape(str(summary['strategy']))}</span>
+      </h3>
+      <div class="muted small" style="margin-bottom:8px">{html_lib.escape(summary['name'] or '未命名团队')} · {html_lib.escape(summary['objective'] or '目标待对齐')}</div>
+      {body}
+      <div style="margin-top:12px"><a class="btn" href="{ui_url(config['base_path'], '/team')}">查看排兵布阵 →</a></div>
+    </div>
+    """
+
+
+def ui_page_team(config: dict[str, Any]) -> str:
+    team = load_team()
+    summary = team_summary(team)
+    label, badge = ui_team_badge(summary)
+    errors = summary.get("errors") or []
+    error_html = (
+        '<div class="banner warn"><b>启动闸门未通过：</b>'
+        + "；".join(html_lib.escape(str(error)) for error in errors)
+        + "。完成评审并同步前，Edward 不得开展实质工作。</div>"
+        if errors
+        else ""
+    )
+    if summary.get("effective_status") == "approved" and summary.get("synced"):
+        gate = '<div class="banner ok">团队协议已批准并同步，Edward 每次上班必须按此编制派发 subagent。</div>'
+    elif summary.get("effective_status") == "approved":
+        gate = '<div class="banner warn">团队已批准但尚未同步到 opencode。运行 <code>edward team sync</code> 并重启班次后才会生效。</div>'
+    else:
+        gate = '<div class="banner warn">团队尚未获批：当前处于初始化/评审阶段，不能按此团队开工。</div>'
+
+    role_rows = []
+    for role in team.get("roles", []):
+        responsibilities_html = "".join(
+            f"<li>{html_lib.escape(str(item))}</li>" for item in role.get("responsibilities") or []
+        )
+        deliverables_html = "".join(
+            f"<li>{html_lib.escape(str(item))}</li>" for item in role.get("deliverables") or []
+        )
+        responsibilities = responsibilities_html or '<li class="muted">未填写</li>'
+        deliverables = deliverables_html or '<li class="muted">—</li>'
+        permissions = role.get("permissions") or {}
+        permission_text = " · ".join(
+            f"{html_lib.escape(str(key))}={html_lib.escape(str(value))}"
+            for key, value in permissions.items()
+        )
+        agent = team_agent_name(role)
+        role_rows.append(
+            "<tr>"
+            f"<td><div class='todo-title'>{html_lib.escape(str(role.get('title') or '—'))}</div>"
+            f"<code>{html_lib.escape(str(role.get('id') or '—'))}</code></td>"
+            f"<td>{html_lib.escape(str(role.get('description') or '—'))}</td>"
+            f"<td><ul class='list'>{responsibilities}</ul></td>"
+            f"<td><ul class='list'>{deliverables}</ul></td>"
+            f"<td><code>{html_lib.escape(agent)}</code><div class='muted small'>{html_lib.escape(permission_text)}</div></td>"
+            "</tr>"
+        )
+    roles_table = (
+        '<div class="table-wrap"><table>'
+        "<thead><tr><th>角色</th><th>定位</th><th>责任</th><th>交付物</th><th>subagent / 权限</th></tr></thead>"
+        f"<tbody>{''.join(role_rows)}</tbody></table></div>"
+        if role_rows
+        else '<div class="empty">尚未定义角色。</div>'
+    )
+
+    phase_rows = []
+    for phase in team.get("workflow", []):
+        phase_rows.append(
+            "<tr>"
+            f"<td><code>{html_lib.escape(str(phase.get('phase') or '—'))}</code></td>"
+            f"<td>{html_lib.escape(' → '.join(phase.get('roles') or []))}</td>"
+            f"<td>{html_lib.escape(str(phase.get('description') or '—'))}</td>"
+            "</tr>"
+        )
+    workflow_table = (
+        '<div class="table-wrap"><table>'
+        "<thead><tr><th>工序</th><th>角色顺序</th><th>说明</th></tr></thead>"
+        f"<tbody>{''.join(phase_rows)}</tbody></table></div>"
+        if phase_rows
+        else '<div class="empty">尚未编排工序。</div>'
+    )
+
+    rules = (team.get("orchestration") or {}).get("rules") or []
+    rules_html = (
+        '<ul class="list">'
+        + "".join(f"<li>{html_lib.escape(str(rule))}</li>" for rule in rules)
+        + "</ul>"
+        if rules
+        else '<div class="empty">尚未填写编排规则。</div>'
+    )
+
+    content = f"""
+    <div class="page-head">
+      <div><h2>团队编制</h2><div class="sub">排兵布阵记录于 edward/execution/team.yaml · 批准后同步为 opencode subagent</div></div>
+      <a class="btn" href="{ui_url(config['base_path'], '/todos')}">查看待办</a>
+    </div>
+    {gate}
+    {error_html}
+    <div class="grid">
+      <div class="stat"><div class="label">团队状态</div><div class="value" style="font-size:15px">{html_lib.escape(label)}</div><div class="hint">{html_lib.escape(summary['name'] or '未命名团队')}</div></div>
+      <div class="stat"><div class="label">角色</div><div class="value">{summary['role_count']}</div><div class="hint">工序 {summary['phase_count']} 个</div></div>
+      <div class="stat"><div class="label">协同策略</div><div class="value" style="font-size:15px">{html_lib.escape(str(summary['strategy']))}</div><div class="hint">subagent 前缀 edward-</div></div>
+      <div class="stat"><div class="label">同步状态</div><div class="value" style="font-size:15px">{'已同步' if summary['synced'] else '未同步'}</div><div class="hint">{html_lib.escape(str(summary.get('synced_at') or '—'))}</div></div>
+    </div>
+    <div class="card">
+      <h3>批准信息</h3>
+      <dl class="kv">
+        <dt>团队目标</dt><dd>{html_lib.escape(summary['objective'] or '—')}</dd>
+        <dt>批准人</dt><dd>{html_lib.escape(str(summary.get('approved_by') or '—'))}</dd>
+        <dt>批准时间</dt><dd>{html_lib.escape(str(summary.get('approved_at') or '—'))}</dd>
+        <dt>评审依据</dt><dd>{html_lib.escape(str(summary.get('approval_reference') or '—'))}</dd>
+        <dt>协议文件</dt><dd><code>{html_lib.escape(str(TEAM_FILE))}</code></dd>
+        <dt>生效方式</dt><dd>人类批准 → <code>edward team sync</code> → 下一班次加载 subagent（当前进程不热更新）</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <h3>排兵布阵</h3>
+      {roles_table}
+    </div>
+    <div class="card">
+      <h3>工序编排</h3>
+      {workflow_table}
+    </div>
+    <div class="card">
+      <h3>编排规则</h3>
+      {rules_html}
+    </div>
+    """
+    return ui_layout(config, "团队编制", "/team", content)
+
+
 def ui_layout(config: dict[str, Any], title: str, active: str, content: str, status: dict[str, Any] | None = None) -> str:
     status = status or ui_status_payload()
     base_path = config["base_path"]
     nav_items = [
         ("/", "看板"),
+        ("/team", "团队"),
         ("/todos", "待办"),
         ("/timeline", "执行时间"),
         ("/plan", "计划"),
@@ -3062,6 +4284,7 @@ def ui_layout(config: dict[str, Any], title: str, active: str, content: str, sta
 
 def ui_page_dashboard(config: dict[str, Any]) -> str:
     base_path = config["base_path"]
+    team_card = ui_team_summary_card(config)
     todo_card = ui_todo_summary_card(config)
     custom_index = Path(config["document_root"]) / "index.html"
     if custom_index.exists():
@@ -3070,6 +4293,7 @@ def ui_page_dashboard(config: dict[str, Any]) -> str:
           <div><h2>看板</h2><div class="sub">自定义看板由 Edward 生成 · 数据来自 dashboard/data/latest.json</div></div>
           <a class="btn" href="{ui_url(base_path, '/custom/')}" target="_blank" rel="noreferrer">新窗口打开 ↗</a>
         </div>
+        {team_card}
         {todo_card}
         <div class="iframe-wrap"><iframe class="dash-frame" src="{ui_url(base_path, '/custom/')}" loading="lazy"></iframe></div>
         """
@@ -3114,6 +4338,7 @@ def ui_page_dashboard(config: dict[str, Any]) -> str:
       <div><h2>看板</h2><div class="sub">当前为默认看板 · 自定义页面放在 dashboard/index.html</div></div>
       <a class="btn" href="{ui_url(base_path, '/timeline')}">查看执行时间</a>
     </div>
+    {team_card}
     {todo_card}
     {latest_html}
     {body}
@@ -3701,6 +4926,10 @@ def ui_make_handler(config: dict[str, Any], csrf: str):
                 self._send_html(ui_page_dashboard(config))
                 return
 
+            if subpath == "/team":
+                self._send_html(ui_page_team(config))
+                return
+
             if subpath == "/todos":
                 self._send_html(ui_page_todos(config))
                 return
@@ -3774,6 +5003,10 @@ def ui_make_handler(config: dict[str, Any], csrf: str):
 
             if subpath == "/api/todos":
                 self._send_json(ui_todos_payload())
+                return
+
+            if subpath == "/api/team":
+                self._send_json(team_payload())
                 return
 
             if subpath == "/api/reports":
@@ -4056,6 +5289,33 @@ def build_parser() -> argparse.ArgumentParser:
     todo_show.add_argument("todo_id", help="待办 ID")
     todo_show.add_argument("--json", action="store_true", help="输出 JSON")
     todo_show.set_defaults(func=cmd_todo_show)
+
+    team_parser = subparsers.add_parser("team", help="管理团队编制协议与 subagent")
+    team_sub = team_parser.add_subparsers(dest="team_command", required=True)
+
+    team_init = team_sub.add_parser("init", help="创建团队协议草案")
+    team_init.set_defaults(func=cmd_team_init)
+
+    team_show = team_sub.add_parser("show", help="查看团队协议与排兵布阵")
+    team_show.add_argument("--json", action="store_true", help="输出 JSON")
+    team_show.set_defaults(func=cmd_team_show)
+
+    team_status = team_sub.add_parser("status", help="查看批准与同步状态")
+    team_status.add_argument("--json", action="store_true", help="输出 JSON")
+    team_status.set_defaults(func=cmd_team_status)
+
+    team_validate = team_sub.add_parser("validate", help="校验团队协议")
+    team_validate.add_argument("--json", action="store_true", help="输出 JSON")
+    team_validate.set_defaults(func=cmd_team_validate)
+
+    team_approve = team_sub.add_parser("approve", help="记录人类批准并锁定设计")
+    team_approve.add_argument("--by", required=True, help="批准人（人类领导，不能是 edward/agent）")
+    team_approve.add_argument("--ref", required=True, help="评审依据，如 report-reply 文件或会议结论")
+    team_approve.set_defaults(func=cmd_team_approve)
+
+    team_sync = team_sub.add_parser("sync", help="把已批准协议同步为 opencode subagent")
+    team_sync.add_argument("--json", action="store_true", help="输出 JSON")
+    team_sync.set_defaults(func=cmd_team_sync)
 
     run_parser = subparsers.add_parser("run-now", help="立即触发一个班次")
     run_parser.add_argument("--dry-run", action="store_true", help="只打印将执行的命令")

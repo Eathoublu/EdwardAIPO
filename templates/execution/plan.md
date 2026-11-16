@@ -22,6 +22,14 @@
 - 下一班次候选任务：
 - 预计完成条件：
 
+## 团队编制
+
+- 协议文件：`edward/execution/team.yaml`
+- 人类评审状态：draft / approved / changed
+- subagent 同步：是 / 否
+- 工序与角色：
+- 团队设计变更记录：
+
 ## 看板系统
 
 - 指标定义：`edward/execution/dashboard/metrics.json`

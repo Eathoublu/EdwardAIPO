@@ -1,0 +1,67 @@
+# Edward 团队协议
+# 项目初始化时由 Edward 起草，必须与 goal / plan / KPI / 工作方案一起交人类评审。
+# 人类批准后才能 team sync 生成 subagent；一旦开工，每个工作项都必须通过 task 调用协议中的角色。
+#
+# 字段说明：
+# - status: draft（待评审）或 approved（已批准）
+# - approval.content_hash: approve 时自动写入；批准后设计若有变化，会要求重新评审
+# - orchestration.strategy: sequential / parallel / mixed
+# - roles[].id: 小写字母开头，总长 2-41，仅含小写字母、数字、连字符；生成的 subagent 名为 edward-<id>
+# - `.opencode/agents/edward-*.md` 为 team sync 保留的生成目录，禁止手工放入其它同名文件
+# - roles[].responsibilities / deliverables: 该角色的责任边界和交付物
+# - roles[].can_delegate: 是否允许该 subagent 继续用 task 委派
+# - workflow: 工序编排，roles 引用上面的角色 id
+
+version: 1
+status: draft
+name: ""
+objective: ""
+approval:
+  approved_by: null
+  approved_at: null
+  reference: null
+  content_hash: null
+orchestration:
+  strategy: sequential
+  rules: []
+roles: []
+workflow: []
+
+# 排兵布阵示例（按项目实际需求改写，不要直接保留占位角色）：
+#
+# roles:
+#   - id: architect
+#     title: "架构师"
+#     description: "负责技术方案、模块拆分和接口设计"
+#     can_delegate: false
+#     model: ""
+#     temperature: 0.2
+#     permissions:
+#       edit: "allow"
+#       bash: "allow"
+#       task: "deny"
+#     responsibilities:
+#       - "拆解需求与模块边界"
+#       - "定义接口和数据流"
+#     deliverables:
+#       - "架构设计与技术方案"
+#     prompt: |
+#       先读 goal、plan 和相关代码，再给出设计。
+#       明确取舍、风险和验证方式。
+#   - id: reviewer
+#     title: "评审员"
+#     description: "独立检查实现质量和验收标准"
+#     responsibilities:
+#       - "审查正确性、边界和回归风险"
+#     deliverables:
+#       - "评审结论与问题清单"
+#
+# workflow:
+#   - phase: design
+#     description: "方案设计"
+#     roles:
+#       - architect
+#   - phase: review
+#     description: "独立评审"
+#     roles:
+#       - reviewer
